@@ -453,7 +453,8 @@ def run_maxwell_filter(
         )
 
     logger.info(**gen_log_kwargs(message="Maxwell filtering"))
-    raw_sss = mne.preprocessing.maxwell_filter(raw, **mf_kws)
+    print('do iterative')
+    raw_sss = mne.preprocessing.maxwell_filter(raw, **mf_kws, iterative=True)
     del raw
     gc.collect()
 
