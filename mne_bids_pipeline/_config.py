@@ -3,6 +3,7 @@
 from collections.abc import Callable, Sequence
 from typing import Annotated, Any, Literal
 
+import pandas as pd
 from annotated_types import Ge, Interval, Len, MinLen
 from mne import Covariance
 from mne_bids import BIDSPath
@@ -313,7 +314,7 @@ Can also be `None` if you do not want to create bipolar channels.
     ```
 """
 
-eeg_reference: Literal["average"] | str | Sequence["str"] = "average"
+eeg_reference: Literal["average"] | str | Sequence[str] = "average"
 """
 The EEG reference to use. If `average`, will use the average reference,
 i.e. the average across all channels. If a string, must be the name of a single
@@ -385,7 +386,7 @@ doesn't contain coordinates for some channels.
     ```
 """
 
-analyze_channels: Literal["all", "ch_types"] | Annotated[Sequence["str"], MinLen(1)] = (
+analyze_channels: Literal["all", "ch_types"] | Annotated[Sequence[str], MinLen(1)] = (
     "ch_types"
 )
 """
@@ -590,7 +591,8 @@ https://mne.tools/stable/generated/mne.preprocessing.find_bad_channels_maxwell
 
 use_maxwell_filter: bool = False
 """
-Whether or not to use Maxwell filtering to preprocess the data.
+Whether or not to use [Maxwell filtering][mne.preprocessing.maxwell_filter] to
+preprocess the data.
 
 !!! warning
     If the data were recorded with internal active compensation (MaxShield),
@@ -685,9 +687,16 @@ account, we are realigning all data to a single position. For this, you can:
 
 mf_int_order: int = 8
 """
-Internal order for the Maxwell basis. Can be set to something lower (e.g., 6
-or higher for datasets where lower or higher spatial complexity, respectively,
-is expected.
+Internal order for the Maxwell basis. Can increase or decrease for datasets where
+neural signals with higher or lower spatial complexity are expected.
+Per MNE, the default values are appropriate for most use cases.
+"""
+
+mf_ext_order: int = 3
+"""
+External order for the Maxwell basis. Can increase or decrease for datasets where
+environmental artifacts with higher or lower spatial complexity are expected.
+Per MNE, the default values are appropriate for most use cases.
 """
 
 mf_reference_run: str | None = None
@@ -714,7 +723,7 @@ location is used.
     ```python
     mf_cal_fname = '/path/to/your/file/calibration_cal.dat'
     ```
-"""  # noqa : E501
+"""
 
 mf_cal_missing: Literal["ignore", "warn", "raise"] = "raise"
 """
@@ -736,7 +745,7 @@ location is used.
     ```python
     mf_ctc_fname = '/path/to/your/file/crosstalk_ct.fif'
     ```
-"""  # noqa : E501
+"""
 
 mf_ctc_missing: Literal["ignore", "warn", "raise"] = "raise"
 """
@@ -994,6 +1003,25 @@ this to `'merge'`.
     April 1st, 2021.
 """
 
+epochs_custom_metadata: pd.DataFrame | dict[str, Any] | None = None
+
+"""
+Pandas `DataFrame` containing custom metadata. The custom metadata will be
+horizontally joined with the metadata generated from `events.tsv`.
+The number of rows in the custom metadata must match the number of rows in
+the events metadata (after filtering by `conditions`).
+
+The metadata can also be formatted as a `dict`, with keys being the `subject`,
+`session`, and/or `task`, and the values being a `DataFrame`. e.g.:
+```python
+epochs_custom_metadata = {'sub-01': {'ses-01': {'task-taskA': my_DataFrame}}}
+epochs_custom_metadata = {'ses-01': my_DataFrame1, 'ses-02': my_DataFrame2}
+```
+
+If None, don't use custom metadata.
+"""
+
+
 epochs_metadata_tmin: float | str | list[str] | None = None
 """
 The beginning of the time window used for epochs metadata generation. This setting
@@ -1068,7 +1096,7 @@ unknown metadata column, a warning will be emitted and all epochs will be kept.
     ```python
     epochs_metadata_query = ['response_missing.isna()']
     ```
-"""  # noqa: E501
+"""
 
 conditions: Sequence[str] | dict[str, str] | None = None
 """
@@ -1084,7 +1112,8 @@ Passing a dictionary allows to assign a name to map a complex condition name
 
 This is a **required** parameter in the configuration file, unless you are
 processing resting-state data. If left as `None` and
-[`task_is_rest`][mne_bids_pipeline._config.task_is_rest] is not `True`, we will raise an error.
+[`task_is_rest`][mne_bids_pipeline._config.task_is_rest] is not `True`, we will raise an
+error.
 
 ???+ example "Example"
     Specifying conditions as lists of strings:
@@ -1101,7 +1130,7 @@ processing resting-state data. If left as `None` and
     conditions = {'simple_name': 'complex/condition/with_subconditions'}
     conditions = {'correct': 'response/correct',
                   'incorrect': 'response/incorrect'}
-"""  # noqa : E501
+"""
 
 epochs_tmin: float = -0.2
 """
@@ -1199,9 +1228,12 @@ Artifact regression is applied before SSP or ICA.
     miscellaneous channels, you could do:
 
     ```python
-    regress_artifact = {"picks": "meg", "picks_artifact": ["MISC 001", "MISC 002", "MISC 003"]}
+    regress_artifact = {
+        "picks": "meg",
+        "picks_artifact": ["MISC 001", "MISC 002", "MISC 003"]
+    }
     ```
-"""  # noqa: E501
+"""
 
 spatial_filter: Literal["ssp", "ica"] | None = None
 """
@@ -1491,7 +1523,8 @@ will generate a dictionary with (hopefully!) optimal thresholds for each
 channel type.
 
 If `"autoreject_local"`, use "local" `autoreject` to detect (and potentially repair) bad
-channels in each epoch. Use [`autoreject_n_interpolate`][mne_bids_pipeline._config.autoreject_n_interpolate]
+channels in each epoch.
+Use [`autoreject_n_interpolate`][mne_bids_pipeline._config.autoreject_n_interpolate]
 to control how many channels are allowed to be bad before an epoch gets dropped.
 
 ???+ example "Example"
@@ -1502,7 +1535,7 @@ to control how many channels are allowed to be bad before an epoch gets dropped.
     reject = "autoreject_global"  # find global (per channel type) PTP thresholds
     reject = "autoreject_local"  # find local (per channel) thresholds and repair epochs
     ```
-"""  # noqa: E501
+"""
 
 reject_tmin: float | None = None
 """
@@ -1693,7 +1726,7 @@ on **all** time points.
 
 Because each classifier is trained and tested on **all** time points, this
 procedure may take a significant amount of time.
-"""  # noqa: E501
+"""
 
 decoding_time_generalization_decim: int = 1
 """

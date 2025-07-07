@@ -9,6 +9,7 @@
 - New config options [`mf_cal_missing`][mne_bids_pipeline._config.mf_cal_missing] and [`mf_ctc_missing`][mne_bids_pipeline._config.mf_ctc_missing] for handling missing calibration and cross-talk files (#1057 by @harrisonritz)
 - New config options [`find_bad_channels_extra_kws`][mne_bids_pipeline._config.find_bad_channels_extra_kws], [`notch_extra_kws`][mne_bids_pipeline._config.notch_extra_kws], and [`bandpass_extra_kws`][mne_bids_pipeline._config.bandpass_extra_kws] to pass additional keyword arguments to `mne.preprocessing.find_bad_channels_maxwell`, `mne.filter.notch_filter`, and `mne.filter.filter_data` respectively (#1061 by @harrisonritz)
 - Config option [`ssp_ecg_channel`][mne_bids_pipeline._config.ssp_ecg_channel] now allows dict values, for setting a different channel name for each subject/session (#1062 by @drammock)
+- New config option [`epochs_custom_metadata`][mne_bids_pipeline._config.epochs_custom_metadata] allows for custom metadata when creating epochs. (#1088 by @harrisonritz)
 
 ### :warning: Behavior changes
 
@@ -29,10 +30,11 @@
     1. Emptyroom files that lack cHPI channels will now be processed (for line noise only) instead of raising an error.
     2. cHPI filtering is now performed before movement compensation.
 
-- Fix bug where the ``config.proc`` parameter was not used properly during forward model creation (#1014 by @larsoner)
+- Fix bug where the `config.proc` parameter was not used properly during forward model creation (#1014 by @larsoner)
 - Fix bug where emptyroom recordings containing EEG channels would crash the pipeline during maxwell filtering (#1040 by @drammock)
-- Fix bug where only having mag sensors would crash compute_rank in maxwell filtering (#1061 by @harrisonritz)
-
+- Fix bug where only having mag sensors would crash compute_rank during maxwell filtering or epoching (#1061 and #1069 by @harrisonritz)
+- Improvements to template config file generation (#1074 by @drammock)
+- Fix bug where `mf_int_order` wasn't passed to `maxwell_filter`. Added config option for `mf_ext_order`. (#1092 by @harrisonritz)
 
 ### :books: Documentation
 
@@ -47,4 +49,5 @@
 - Improve logging messages in maxwell filtering steps. (#893 by @drammock)
 - Validate extra config params passed in during testing. (#1044 by @drammock)
 - New testing/example dataset "funloc" added. (#1045 by @drammock)
-- Better testing of session-specific MRIs. (#1039 by @drammock)
+- Bugfixes and better testing of session-specific MRIs. (#1039 and #1067 by @drammock)
+- Drop legacy function `inst.pick_types` in favor of `inst.pick` (#1073 by @PierreGtch)

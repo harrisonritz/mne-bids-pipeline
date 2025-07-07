@@ -279,6 +279,8 @@ def _check_config(config: SimpleNamespace, config_path: PathLike | None) -> None
         "destination",
         "head_pos",
         "extended_proj",
+        "int_order",
+        "ext_order",
     )
     # check `mf_extra_kws` for things that shouldn't be in there
     if duplicates := (set(config.mf_extra_kws) & set(mf_reserved_kwargs)):
@@ -300,10 +302,11 @@ def _check_config(config: SimpleNamespace, config_path: PathLike | None) -> None
     if config.ssp_ecg_channel and isinstance(config.ssp_ecg_channel, dict):
         pattern = re.compile(r"^sub-[A-Za-z\d]+(_ses-[A-Za-z\d]+)?$")
         matches = set(filter(pattern.match, config.ssp_ecg_channel))
+        newline_indent = "\n  "
         if mismatch := (set(config.ssp_ecg_channel) - matches):
             raise ConfigError(
                 "Malformed keys in ssp_ecg_channel dict:\n  "
-                f"{'\n  '.join(sorted(mismatch))}"
+                f"{newline_indent.join(sorted(mismatch))}"
             )
         # also make sure there are values for all subjects/sessions:
         missing = list()
@@ -319,7 +322,7 @@ def _check_config(config: SimpleNamespace, config_path: PathLike | None) -> None
                     )
         if missing:
             raise ConfigError(
-                f"Missing entries in ssp_ecg_channel:\n  {'\n  '.join(missing)}"
+                f"Missing entries in ssp_ecg_channel:\n  {newline_indent.join(missing)}"
             )
 
     reject = config.reject
@@ -449,7 +452,7 @@ def _default_factory(key: str, val: Any) -> Any:
                     default_factory = partial(typ, **allowlist[idx])  # type: ignore
                 else:
                     assert typ is list
-                    default_factory = partial(typ, allowlist[idx])  # type: ignore
+                    default_factory = partial(typ, allowlist[idx])
             return field(default_factory=default_factory)
     return val
 
