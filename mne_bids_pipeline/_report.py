@@ -914,8 +914,8 @@ def _render_bem(
         subject=cfg.fs_subject,
         subjects_dir=cfg.fs_subjects_dir,
         title="BEM",
-        width=1024,
-        decim=2,
+        width=512,
+        decim=8,
         replace=True,
         n_jobs=1,  # prevent automatic parallelization
     )
