@@ -304,6 +304,28 @@ class ConditionalStepMemory:
         self.memory.clear()
 
 
+def _serialize_config(config: SimpleNamespace) -> pd.DataFrame:
+    """Serialize a config namespace to a single-row DataFrame of JSON strings."""
+    assert isinstance(config, SimpleNamespace), type(config)
+    cf_dict = dict()
+    for key, val in config.__dict__.items():
+        # We need to be careful about functions, json_tricks does not work with them
+        if inspect.isfunction(val):
+            new_val = ""
+            if func_file := inspect.getfile(val):
+                new_val += f"{func_file}:"
+            if getattr(val, "__qualname__", None):
+                new_val += val.__qualname__
+            val = "custom callable" if not new_val else new_val
+        val = json_tricks.dumps(val, indent=4, sort_keys=False)
+        # 32767 char limit per cell (could split over lines but if something is
+        # this long, you'll probably get the gist from the first 32k chars)
+        if len(val) > 32767:
+            val = val[:32765] + " …"
+        cf_dict[key] = val
+    return pd.DataFrame([cf_dict], dtype=object)
+
+
 def save_logs(*, config: SimpleNamespace, logs: Iterable[pd.Series]) -> None:
     fname = config.deriv_root / f"task-{get_task(config)}_log.xlsx"
 
@@ -314,36 +336,79 @@ def save_logs(*, config: SimpleNamespace, logs: Iterable[pd.Series]) -> None:
     df = pd.DataFrame(logs)
     del logs
 
-    with FileLock(fname.with_suffix(fname.suffix + ".lock")):
-        append = fname.exists()
-        writer = pd.ExcelWriter(
-            fname,
-            engine="openpyxl",
-            mode="a" if append else "w",
-            if_sheet_exists="replace" if append else None,
-        )
-        assert isinstance(config, SimpleNamespace), type(config)
-        cf_dict = dict()
-        for key, val in config.__dict__.items():
-            # We need to be careful about functions, json_tricks does not work with them
-            if inspect.isfunction(val):
-                new_val = ""
-                if func_file := inspect.getfile(val):
-                    new_val += f"{func_file}:"
-                if getattr(val, "__qualname__", None):
-                    new_val += val.__qualname__
-                val = "custom callable" if not new_val else new_val
-            val = json_tricks.dumps(val, indent=4, sort_keys=False)
-            # 32767 char limit per cell (could split over lines but if something is
-            # this long, you'll probably get the gist from the first 32k chars)
-            if len(val) > 32767:
-                val = val[:32765] + " …"
-            cf_dict[key] = val
-        cf_df = pd.DataFrame([cf_dict], dtype=object)
-        with writer:
-            # Config first then the data
-            cf_df.to_excel(writer, sheet_name="config", index=False)
-            df.to_excel(writer, sheet_name=sheet_name, index=False)
+    cf_df = _serialize_config(config)
+
+    # Write to a per-job temp file first, then merge into the shared Excel
+    # under a lock with retries. This avoids race conditions on network
+    # filesystems (NFS/Lustre/GPFS) where FileLock can be unreliable.
+    import os
+    import tempfile
+    import random
+
+    max_retries = 10
+    base_delay = 0.5  # seconds
+
+    for attempt in range(max_retries):
+        try:
+            with FileLock(fname.with_suffix(fname.suffix + ".lock"), timeout=120):
+                # Write to a temporary file first, then do an atomic-ish rename
+                # to minimize the window where the shared file is being modified.
+                tmp_fd, tmp_path = tempfile.mkstemp(
+                    suffix=".xlsx", dir=fname.parent, prefix=f".{fname.stem}_tmp_"
+                )
+                os.close(tmp_fd)
+                tmp_path = pathlib.Path(tmp_path)
+                try:
+                    if fname.exists():
+                        # Copy existing content so we can append
+                        import shutil
+
+                        shutil.copy2(fname, tmp_path)
+                        mode, if_sheet_exists = "a", "replace"
+                    else:
+                        mode, if_sheet_exists = "w", None
+
+                    writer = pd.ExcelWriter(
+                        tmp_path,
+                        engine="openpyxl",
+                        mode=mode,
+                        if_sheet_exists=if_sheet_exists,
+                    )
+                    with writer:
+                        cf_df.to_excel(writer, sheet_name="config", index=False)
+                        df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+                    # Atomic replace (on same filesystem this is rename)
+                    tmp_path.replace(fname)
+                except BaseException:
+                    # Clean up temp file on any failure
+                    tmp_path.unlink(missing_ok=True)
+                    raise
+            # Success — break out of retry loop
+            break
+        except (OSError, PermissionError, TimeoutError) as e:
+            if attempt < max_retries - 1:
+                delay = base_delay * (2**attempt) + random.uniform(0, 0.5)
+                logger.warning(
+                    **gen_log_kwargs(
+                        message=(
+                            f"save_logs attempt {attempt + 1}/{max_retries} failed "
+                            f"({e}), retrying in {delay:.1f}s …"
+                        ),
+                        emoji="⏳",
+                    )
+                )
+                time.sleep(delay)
+            else:
+                logger.error(
+                    **gen_log_kwargs(
+                        message=(
+                            f"save_logs failed after {max_retries} attempts: {e}"
+                        ),
+                        emoji="❌",
+                    )
+                )
+                raise
 
 
 def _update_for_splits(
