@@ -326,7 +326,7 @@ def find_ica_artifacts(
             ecg_scores=ecg_scores if len(ecg_scores) else None,
             eog_scores=eog_scores if len(eog_scores) else None,
             replace=True,
-            n_jobs=1,  # avoid automatic parallelization
+            n_jobs=-1,  # avoid automatic parallelization
             tags=("ica",),  # the default but be explicit
         )
 
