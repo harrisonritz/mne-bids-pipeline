@@ -17,7 +17,7 @@ import pandas as pd
 from mne.decoding import Vectorizer
 from mne_bids import BIDSPath
 from scipy.io import loadmat, savemat
-from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.model_selection import LeaveOneGroupOut, StratifiedKFold, cross_val_score
 from sklearn.pipeline import make_pipeline
 
 from mne_bids_pipeline._config_utils import (
@@ -143,20 +143,36 @@ def run_epochs_decoding(
 
     # Now, actually run the classification, and evaluate it via a
     # cross-validation procedure.
-    cv = StratifiedKFold(
-        shuffle=True,
-        random_state=cfg.random_state,
-        n_splits=cfg.decoding_n_splits,
-    )
-    scores = cross_val_score(
-        estimator=clf,
-        X=X,
-        y=y,
-        cv=cv,
-        scoring="roc_auc",
-        n_jobs=1,
-        error_score="raise",
-    )
+    if cfg.decoding_LOGO:
+        group = epochs.metadata[cfg.decoding_LOGO_group].values
+
+        # number of unique groups
+        scores = cross_val_score(
+            estimator=clf,
+            X=X,
+            y=y,
+            cv=LeaveOneGroupOut(),
+            groups=group,
+            scoring="roc_auc",
+            n_jobs=1,
+            error_score="raise",
+        )
+
+    else:
+        cv = StratifiedKFold(
+            shuffle=True,
+            random_state=cfg.random_state,
+            n_splits=cfg.decoding_n_splits,
+        )
+        scores = cross_val_score(
+            estimator=clf,
+            X=X,
+            y=y,
+            cv=cv,
+            scoring="roc_auc",
+            n_jobs=1,
+            error_score="raise",
+        )
 
     # Save the scores
     a_vs_b = f"{cond_names[0]}+{cond_names[1]}".replace(op.sep, "")
@@ -247,6 +263,8 @@ def get_config(
         decoding_epochs_tmin=config.decoding_epochs_tmin,
         decoding_epochs_tmax=config.decoding_epochs_tmax,
         decoding_n_splits=config.decoding_n_splits,
+        decoding_LORO=config.decoding_LORO,
+        decoding_LORO_group=config.decoding_LORO_group,
         random_state=config.random_state,
         analyze_channels=config.analyze_channels,
         ch_types=config.ch_types,

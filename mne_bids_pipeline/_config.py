@@ -1847,6 +1847,27 @@ The number of folds (also called "splits") to use in the K-fold cross-validation
 scheme.
 """
 
+
+decoding_LOGO: bool = False
+"""
+do leave-one-group-out (LOGO) cross-validation, where the "groups" are defined by the
+metadata column specified in `decoding_LOGO_group`. This is a more conservative approach
+to cross-validation, as it ensures that the model is tested on data from a group that
+was not seen during training. This can help to prevent overfitting and provide a more
+realistic estimate of the model's performance on unseen data.
+"""
+
+decoding_LOGO_group: str | None = None
+"""
+The name of the metadata column to use for defining the groups in LOGO cross-validation.
+This parameter is only relevant if `decoding_LOGO` is set to `True`. The values in this
+column will be used to define the groups for LOGO cross-validation. Each unique value
+in this column will be treated as a separate group, and the model will be trained on
+all groups except one, which will be used for testing. This process will be repeated
+until each group has been used as the test set once.
+"""
+
+
 decoding_time_generalization: bool = False
 """
 Whether to perform time generalization.
