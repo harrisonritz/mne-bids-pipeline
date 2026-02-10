@@ -184,13 +184,13 @@ def make_epochs(
     # then pass to epochs.drop(); this allows us to specify a custom drop
     # reason.
     if metadata_query is not None:
-        import pandas.core
+        from pandas.errors import UndefinedVariableError
 
         assert epochs.metadata is not None
 
         try:
             idx_keep = epochs.metadata.eval(metadata_query, engine="python")
-        except pandas.core.computation.ops.UndefinedVariableError:
+        except UndefinedVariableError:
             msg = f"Metadata query failed to select any columns: {metadata_query}"
             logger.warning(**gen_log_kwargs(message=msg))
             return epochs
