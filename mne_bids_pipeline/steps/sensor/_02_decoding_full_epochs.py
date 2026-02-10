@@ -144,15 +144,13 @@ def run_epochs_decoding(
     # Now, actually run the classification, and evaluate it via a
     # cross-validation procedure.
     if cfg.decoding_LOGO:
-        group = epochs.metadata[cfg.decoding_LOGO_group].values
-
         # number of unique groups
         scores = cross_val_score(
             estimator=clf,
             X=X,
             y=y,
             cv=LeaveOneGroupOut(),
-            groups=group,
+            groups=epochs.metadata[cfg.decoding_LOGO_group].values,
             scoring="roc_auc",
             n_jobs=1,
             error_score="raise",
