@@ -25,7 +25,7 @@ from mne.decoding import (
 )
 from mne_bids import BIDSPath
 from scipy.io import loadmat, savemat
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import LeaveOneGroupOut, StratifiedKFold
 from sklearn.pipeline import make_pipeline
 
 from mne_bids_pipeline._config_utils import (
@@ -186,14 +186,26 @@ def run_time_decoding(
             )
             cv_scoring_n_jobs = exec_params.n_jobs
 
-        scores = cross_val_multiscore(
-            estimator,
-            X=X,
-            y=y,
-            cv=cv,
-            n_jobs=cv_scoring_n_jobs,
-            verbose=verbose,  # ensure ProgressBar is shown (can be slow)
-        )
+        if cfg.decoding_LOGO:
+            scores = cross_val_multiscore(
+                estimator,
+                X=X,
+                y=y,
+                cv=LeaveOneGroupOut(),
+                groups=epochs.metadata[cfg.decoding_LOGO_group].values,
+                n_jobs=cv_scoring_n_jobs,
+                verbose=verbose,  # ensure ProgressBar is shown (can be slow)
+            )
+
+        else:
+            scores = cross_val_multiscore(
+                estimator,
+                X=X,
+                y=y,
+                cv=cv,
+                n_jobs=cv_scoring_n_jobs,
+                verbose=verbose,  # ensure ProgressBar is shown (can be slow)
+            )
 
         # let's save the scores now
         a_vs_b = f"{cond_names[0]}+{cond_names[1]}".replace(op.sep, "")
