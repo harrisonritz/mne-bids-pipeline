@@ -15,12 +15,13 @@ from mne_bids import BIDSPath
 
 from mne_bids_pipeline._config_utils import (
     _bids_kwargs,
+    _get_ss,
     get_fs_subject,
     get_fs_subjects_dir,
     get_noise_cov_bids_path,
-    get_subjects_sessions,
     sanitize_cond_name,
 )
+from mne_bids_pipeline._io import _read_json
 from mne_bids_pipeline._logging import gen_log_kwargs, logger
 from mne_bids_pipeline._parallel import get_parallel_backend, parallel_func
 from mne_bids_pipeline._report import _all_conditions, _open_report, _sanitize_cond_tag
@@ -67,10 +68,10 @@ def get_input_fnames_inverse(
         source_info_path_update = cfg.source_info_path_update
     in_files["info"] = bids_path.copy().update(**source_info_path_update)
     in_files["forward"] = bids_path.copy().update(suffix="fwd")
+    cov_path = get_noise_cov_bids_path(cfg=cfg, subject=subject, session=session)
     if cfg.noise_cov != "ad-hoc":
-        in_files["cov"] = get_noise_cov_bids_path(
-            cfg=cfg, subject=subject, session=session
-        )
+        in_files["cov"] = cov_path
+    in_files["rank"] = cov_path.copy().update(suffix="rank", extension=".json")
     if "evoked" in cfg.inverse_targets:
         in_files["evoked"] = bids_path.copy().update(suffix="ave")
     return in_files
@@ -104,8 +105,9 @@ def run_inverse(
 
     forward = mne.read_forward_solution(fname_fwd)
     del fname_fwd
+    rank = _read_json(in_files.pop("rank"))
     inverse_operator = make_inverse_operator(
-        info, forward, cov, loose=cfg.loose, depth=cfg.depth, rank="info"
+        info, forward, cov, loose=cfg.loose, depth=cfg.depth, rank=rank
     )
     write_inverse_operator(out_files["inverse"], inverse_operator, overwrite=True)
 
@@ -117,6 +119,7 @@ def run_inverse(
     if "evoked" in in_files:
         fname_ave = in_files.pop("evoked")
         evokeds = mne.read_evokeds(fname_ave)
+        assert isinstance(evokeds, list)
 
         for condition, evoked in zip(conditions, evokeds):
             suffix = f"{sanitize_cond_name(condition)}+{method}+hemi"
@@ -193,11 +196,14 @@ def main(*, config: SimpleNamespace) -> None:
     """Run inv."""
     if not config.run_source_estimation:
         msg = "Skipping, run_source_estimation is set to False …"
-        logger.info(**gen_log_kwargs(message=msg, emoji="skip"))
+        logger.info(**gen_log_kwargs(message=msg))
         return
 
+    ss = _get_ss(config=config)
     with get_parallel_backend(config.exec_params):
-        parallel, run_func = parallel_func(run_inverse, exec_params=config.exec_params)
+        parallel, run_func = parallel_func(
+            run_inverse, exec_params=config.exec_params, n_iter=len(ss)
+        )
         logs = parallel(
             run_func(
                 cfg=get_config(
@@ -209,7 +215,6 @@ def main(*, config: SimpleNamespace) -> None:
                 subject=subject,
                 session=session,
             )
-            for subject, sessions in get_subjects_sessions(config).items()
-            for session in sessions
+            for subject, session in ss
         )
     save_logs(config=config, logs=logs)

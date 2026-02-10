@@ -15,10 +15,10 @@ from sklearn.pipeline import make_pipeline
 from mne_bids_pipeline._config_utils import (
     _bids_kwargs,
     _get_decoding_proc,
+    _get_ss,
     _restrict_analyze_channels,
     get_decoding_contrasts,
     get_eeg_reference,
-    get_subjects_sessions,
 )
 from mne_bids_pipeline._decoding import (
     LogReg,
@@ -174,6 +174,7 @@ def one_subject_decoding(
         epochs.subtract_evoked()
 
     preproc_steps = _decoding_preproc_steps(
+        cfg=cfg,
         subject=subject,
         session=session,
         epochs=epochs,
@@ -187,11 +188,7 @@ def one_subject_decoding(
     clf = make_pipeline(
         *preproc_steps,
         csp,
-        LogReg(
-            solver="liblinear",  # much faster than the default
-            random_state=cfg.random_state,
-            n_jobs=1,
-        ),
+        LogReg(random_state=cfg.random_state),
     )
     cv = StratifiedKFold(
         n_splits=cfg.decoding_n_splits,
@@ -503,8 +500,8 @@ def one_subject_decoding(
                     va="center",
                     rotation=90,
                 )
-            ax.set_xlim([np.min(tmin_list), np.max(tmax_list)])
-            ax.set_ylim([np.min(fmin_list), np.max(fmax_list)])
+            ax.set_xlim((np.min(tmin_list), np.max(tmax_list)))
+            ax.set_ylim((np.min(fmin_list), np.max(fmax_list)))
             ax.set_xlabel("Time (s)")
             ax.set_ylabel("Frequency (Hz)")
             cbar = fig.colorbar(
@@ -531,7 +528,6 @@ def get_config(
 ) -> SimpleNamespace:
     cfg = SimpleNamespace(
         # Data parameters
-        use_maxwell_filter=config.use_maxwell_filter,
         analyze_channels=config.analyze_channels,
         ch_types=config.ch_types,
         eeg_reference=get_eeg_reference(config),
@@ -547,7 +543,7 @@ def get_config(
         decoding_csp_times=config.decoding_csp_times,
         decoding_n_splits=config.decoding_n_splits,
         decoding_contrasts=get_decoding_contrasts(config),
-        n_boot=config.n_boot,
+        cov_rank=config.cov_rank,
         random_state=config.random_state,
         **_bids_kwargs(config=config),
     )
@@ -556,19 +552,24 @@ def get_config(
 
 def main(*, config: SimpleNamespace) -> None:
     """Run all subjects decoding in parallel."""
-    if not config.contrasts or not config.decoding_csp:
-        if not config.contrasts:
-            msg = "No contrasts specified. "
-        else:
-            msg = "No CSP analysis requested. "
-
-        msg += "Skipping …"
-        logger.info(**gen_log_kwargs(message=msg, emoji="skip"))
+    if not config.contrasts:
+        msg = "Skipping, no contrasts specified …"
+        logger.info(**gen_log_kwargs(message=msg))
         return
 
+    if not config.decoding_csp:
+        logger.info(**gen_log_kwargs(message="SKIP"))
+        return
+
+    ss = _get_ss(config=config)
+    ssc = [
+        (subject, session, contrast)
+        for subject, session in ss
+        for contrast in get_decoding_contrasts(config)
+    ]
     with get_parallel_backend(config.exec_params):
         parallel, run_func = parallel_func(
-            one_subject_decoding, exec_params=config.exec_params
+            one_subject_decoding, exec_params=config.exec_params, n_iter=len(ssc)
         )
         logs = parallel(
             run_func(
@@ -578,8 +579,6 @@ def main(*, config: SimpleNamespace) -> None:
                 session=session,
                 contrast=contrast,
             )
-            for subject, sessions in get_subjects_sessions(config).items()
-            for session in sessions
-            for contrast in get_decoding_contrasts(config)
+            for subject, session, contrast in ssc
         )
         save_logs(logs=logs, config=config)

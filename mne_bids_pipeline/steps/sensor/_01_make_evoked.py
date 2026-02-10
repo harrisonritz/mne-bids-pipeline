@@ -7,18 +7,17 @@ from mne_bids import BIDSPath
 
 from mne_bids_pipeline._config_utils import (
     _bids_kwargs,
+    _get_ss,
     _pl,
     _restrict_analyze_channels,
     get_all_contrasts,
     get_eeg_reference,
-    get_subjects_sessions,
 )
 from mne_bids_pipeline._logging import gen_log_kwargs, logger
 from mne_bids_pipeline._parallel import get_parallel_backend, parallel_func
 from mne_bids_pipeline._report import _all_conditions, _open_report, _sanitize_cond_tag
 from mne_bids_pipeline._run import (
     _prep_out_files,
-    _sanitize_callable,
     _update_for_splits,
     failsafe_run,
     save_logs,
@@ -170,7 +169,6 @@ def get_config(
     cfg = SimpleNamespace(
         conditions=config.conditions,
         contrasts=get_all_contrasts(config),
-        noise_cov=_sanitize_callable(config.noise_cov),
         analyze_channels=config.analyze_channels,
         eeg_reference=get_eeg_reference(config),
         ch_types=config.ch_types,
@@ -183,12 +181,15 @@ def get_config(
 def main(*, config: SimpleNamespace) -> None:
     """Run evoked."""
     if config.task_is_rest:
-        msg = "    … skipping: for resting-state task."
+        msg = "Skipping, resting-state task …"
         logger.info(**gen_log_kwargs(message=msg))
         return
 
+    ss = _get_ss(config=config)
     with get_parallel_backend(config.exec_params):
-        parallel, run_func = parallel_func(run_evoked, exec_params=config.exec_params)
+        parallel, run_func = parallel_func(
+            run_evoked, exec_params=config.exec_params, n_iter=len(ss)
+        )
         logs = parallel(
             run_func(
                 cfg=get_config(
@@ -198,7 +199,6 @@ def main(*, config: SimpleNamespace) -> None:
                 subject=subject,
                 session=session,
             )
-            for subject, sessions in get_subjects_sessions(config).items()
-            for session in sessions
+            for subject, session in ss
         )
     save_logs(config=config, logs=logs)

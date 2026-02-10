@@ -14,11 +14,12 @@ from mne_bids import BIDSPath
 from mne_bids_pipeline._config_import import ConfigError
 from mne_bids_pipeline._config_utils import (
     _bids_kwargs,
+    _get_ss,
     _pl,
     _proj_path,
     get_ecg_channel,
+    get_eog_channels,
     get_runs,
-    get_subjects_sessions,
 )
 from mne_bids_pipeline._logging import gen_log_kwargs, logger
 from mne_bids_pipeline._parallel import get_parallel_backend, parallel_func
@@ -100,21 +101,26 @@ def run_ssp(
     projs: dict[str, list[mne.Projection]] = dict()
     proj_kinds = ("ecg", "eog")
     rate_names = dict(ecg="heart", eog="blink")
-    events_fun = dict(ecg=_find_ecg_events, eog=find_eog_events)
     minimums = dict(ecg=cfg.min_ecg_epochs, eog=cfg.min_eog_epochs)
     rejects = dict(ecg=cfg.ssp_reject_ecg, eog=cfg.ssp_reject_eog)
     avg = dict(ecg=cfg.ecg_proj_from_average, eog=cfg.eog_proj_from_average)
     n_projs = dict(ecg=cfg.n_proj_ecg, eog=cfg.n_proj_eog)
-    ch_name: dict[str, str | list[str] | None] = dict(ecg=None, eog=None)
-    if cfg.eog_channels:
-        ch_name["eog"] = cfg.eog_channels
-        assert ch_name["eog"] is not None
-        assert all(ch_name in raw.ch_names for ch_name in ch_name["eog"])
+
+    eog_chs_subj_sess = get_eog_channels(cfg.eog_channels, subject, session)
+
+    ch_name_ecg: str | None = None
+    ch_name_eog: str | list[str] | None = None
+    if eog_chs_subj_sess:
+        ch_name_eog = list(eog_chs_subj_sess)
+        assert ch_name_eog is not None
+        assert all(ch_name in raw.ch_names for ch_name in ch_name_eog)
     if cfg.ssp_ecg_channel:
-        ch_name["ecg"] = get_ecg_channel(config=cfg, subject=subject, session=session)
-        if ch_name["ecg"] not in raw.ch_names:
+        ch_name_ecg = get_ecg_channel(
+            ecg_channel=cfg.ssp_ecg_channel, subject=subject, session=session
+        )
+        if ch_name_ecg not in raw.ch_names:
             raise ConfigError(
-                f"SSP ECG channel '{ch_name['ecg']}' not found in data for "
+                f"SSP ECG channel '{ch_name_ecg}' not found in data for "
                 f"subject {subject}, session {session}"
             )
     if cfg.ssp_meg == "auto":
@@ -123,7 +129,11 @@ def run_ssp(
         projs[kind] = []
         if not any(n_projs[kind].values()):
             continue
-        events = events_fun[kind](raw=raw, ch_name=ch_name[kind])
+        if kind == "ecg":
+            assert isinstance(ch_name_ecg, str | None)
+            events = _find_ecg_events(raw=raw, ch_name=ch_name_ecg)
+        else:
+            events = find_eog_events(raw=raw, ch_name=ch_name_eog)
         n_orig = len(events)
         rate = n_orig / raw.times[-1] * 60
         bpm_msg = f"{rate:5.1f} bpm"
@@ -215,19 +225,25 @@ def run_ssp(
             if kind == "ecg":
                 if cfg.ssp_ecg_channel:
                     picks_trace = [
-                        get_ecg_channel(config=cfg, subject=subject, session=session)
+                        get_ecg_channel(
+                            ecg_channel=cfg.ssp_ecg_channel,
+                            subject=subject,
+                            session=session,
+                        )
                     ]
                 elif "ecg" in proj_epochs:
                     picks_trace = "ecg"
             else:
                 assert kind == "eog"
-                if cfg.eog_channels:
-                    picks_trace = cfg.eog_channels
+                if eog_chs_subj_sess:
+                    # convert to list for compatibility of type annotations
+                    picks_trace = list(eog_chs_subj_sess)
                 elif "eog" in proj_epochs:
                     picks_trace = "eog"
             fig = mne.viz.plot_projs_joint(
                 these_projs, proj_epochs.average(picks="all"), picks_trace=picks_trace
             )
+            assert isinstance(proj_epochs.drop_log, tuple)
             caption = (
                 f"Computed using {len(proj_epochs)} epochs "
                 f"(from {len(proj_epochs.drop_log)} original events)"
@@ -273,12 +289,14 @@ def get_config(
 def main(*, config: SimpleNamespace) -> None:
     """Run SSP."""
     if config.spatial_filter != "ssp":
-        msg = "Skipping …"
-        logger.info(**gen_log_kwargs(message=msg, emoji="skip"))
+        logger.info(**gen_log_kwargs(message="SKIP"))
         return
 
+    ss = _get_ss(config=config)
     with get_parallel_backend(config.exec_params):
-        parallel, run_func = parallel_func(run_ssp, exec_params=config.exec_params)
+        parallel, run_func = parallel_func(
+            run_ssp, exec_params=config.exec_params, n_iter=len(ss)
+        )
         logs = parallel(
             run_func(
                 cfg=get_config(
@@ -289,7 +307,6 @@ def main(*, config: SimpleNamespace) -> None:
                 subject=subject,
                 session=session,
             )
-            for subject, sessions in get_subjects_sessions(config).items()
-            for session in sessions
+            for subject, session in ss
         )
     save_logs(config=config, logs=logs)

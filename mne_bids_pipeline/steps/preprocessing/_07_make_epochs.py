@@ -16,9 +16,9 @@ from mne_bids import BIDSPath
 
 from mne_bids_pipeline._config_utils import (
     _bids_kwargs,
+    _get_ss,
     get_eeg_reference,
     get_runs,
-    get_subjects_sessions,
 )
 from mne_bids_pipeline._import_data import annotations_to_events, make_epochs
 from mne_bids_pipeline._logging import gen_log_kwargs, logger
@@ -103,7 +103,7 @@ def run_epochs(
     for idx, (run, raw_fname) in enumerate(zip(cfg.runs, raw_fnames)):
         msg = f"Loading filtered raw data from {raw_fname.basename}"
         logger.info(**gen_log_kwargs(message=msg))
-        raw = mne.io.read_raw_fif(raw_fname, preload=True)
+        raw = mne.io.read_raw_fif(raw_fname).load_data()
 
         # Only keep the subset of the mapping that applies to the current run
         if cfg.task_is_rest:
@@ -145,7 +145,8 @@ def run_epochs(
             epochs_all_runs = epochs
         else:
             epochs_all_runs = mne.concatenate_epochs(
-                [epochs_all_runs, epochs], on_mismatch="warn"
+                [epochs_all_runs, epochs],  # type: ignore[unresolved-reference]
+                on_mismatch="warn",
             )
 
         if cfg.use_maxwell_filter:
@@ -205,6 +206,7 @@ def run_epochs(
         projection = True if cfg.eeg_reference == "average" else False
         epochs.set_eeg_reference(cfg.eeg_reference, projection=projection)
 
+    assert isinstance(epochs.drop_log, tuple)
     n_epochs_before_metadata_query = len(epochs.drop_log)
 
     msg = (
@@ -349,8 +351,11 @@ def get_config(
 
 def main(*, config: SimpleNamespace) -> None:
     """Run epochs."""
+    ss = _get_ss(config=config)
     with get_parallel_backend(config.exec_params):
-        parallel, run_func = parallel_func(run_epochs, exec_params=config.exec_params)
+        parallel, run_func = parallel_func(
+            run_epochs, exec_params=config.exec_params, n_iter=len(ss)
+        )
         logs = parallel(
             run_func(
                 cfg=get_config(
@@ -361,7 +366,6 @@ def main(*, config: SimpleNamespace) -> None:
                 subject=subject,
                 session=session,
             )
-            for subject, sessions in get_subjects_sessions(config).items()
-            for session in sessions
+            for subject, session in ss
         )
     save_logs(config=config, logs=logs)

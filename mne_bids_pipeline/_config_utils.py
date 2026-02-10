@@ -3,7 +3,7 @@
 import copy
 import functools
 import pathlib
-from collections.abc import Iterable, Sized
+from collections.abc import Iterable, Sequence, Sized
 from inspect import signature
 from types import ModuleType, SimpleNamespace
 from typing import Any, Literal, TypeVar
@@ -437,47 +437,105 @@ def get_task(config: SimpleNamespace) -> str | None:
         return _valid_tasks[0]
 
 
-def get_ecg_channel(config: SimpleNamespace, subject: str, session: str | None) -> str:
-    if isinstance(config.ssp_ecg_channel, str):
-        return config.ssp_ecg_channel
-    for key in (f"sub-{subject}", f"sub-{subject}_ses-{session}"):
-        if val := config.ssp_ecg_channel.get(key):
-            assert isinstance(val, str)  # mypy
-            return val
-    return ""  # mypy
+def _get_ss(
+    *,
+    config: SimpleNamespace,
+) -> list[tuple[str, str | None]]:
+    return [
+        (subject, session)
+        for subject, sessions in get_subjects_sessions(config).items()
+        for session in sessions
+    ]
 
 
-def get_channels_to_analyze(info: mne.Info, config: SimpleNamespace) -> list[str]:
-    # Return names of the channels of the channel types we wish to analyze.
-    # We also include channels marked as "bad" here.
-    # `exclude=[]`: keep "bad" channels, too.
-    kwargs = dict(eog=True, ecg=True, exclude=())
-    if get_datatype(config) == "meg" and _meg_in_ch_types(config.ch_types):
-        pick_idx = mne.pick_types(info, **kwargs)
-
-        if "mag" in config.ch_types:
-            pick_idx = np.concatenate(
-                [pick_idx, mne.pick_types(info, meg="mag", exclude=[])]
-            )
-        if "grad" in config.ch_types:
-            pick_idx = np.concatenate(
-                [pick_idx, mne.pick_types(info, meg="grad", exclude=[])]
-            )
-        if "meg" in config.ch_types:
-            pick_idx = mne.pick_types(info, meg=True, exclude=[])
-        pick_idx.sort()
-    elif config.ch_types == ["eeg"]:
-        pick_idx = mne.pick_types(
-            info, meg=False, eeg=True, eog=True, ecg=True, exclude=[]
+def _get_ssrt(
+    *,
+    config: SimpleNamespace,
+    which: tuple[str, ...] | None = None,
+) -> list[tuple[str, str | None, str | None, str | None]]:
+    kwargs = dict()
+    if which is not None:
+        kwargs["which"] = which
+    return [
+        (subject, session, run, task)
+        for subject, session in _get_ss(config=config)
+        for run, task in get_runs_tasks(
+            config=config,
+            subject=subject,
+            session=session,
+            **kwargs,
         )
-    else:
-        raise RuntimeError(
-            "Something unexpected happened. Please contact "
-            "the mne-bids-pipeline developers. Thank you."
-        )
+    ]
 
-    ch_names = [info["ch_names"][i] for i in pick_idx]
-    return ch_names
+
+def _limit_which_clean(*, config: SimpleNamespace) -> tuple[str, ...]:
+    which: tuple[str, ...] = ()
+    if config.process_raw_clean:
+        which += ("runs",)
+    if config.process_empty_room:
+        which += ("noise",)
+    if config.process_rest:
+        which += ("rest",)
+    return which
+
+
+def _get_channels_generic(
+    channels: Any,
+    subject: str = "",
+    session: str | None = "",
+    *,
+    variable_name: str = "_unspecified_",
+) -> Any:
+    if not isinstance(channels, dict):
+        return channels
+
+    assert isinstance(channels, dict), "channels must be dict or concrete value"
+
+    # session specific ch definition supersedes subject-level ch definition
+    for key in (f"sub-{subject}_ses-{session}", f"sub-{subject}"):
+        # empty list and None are explicitly allowed
+        if key in channels:
+            return channels[key]
+
+    # use try/catch to allow for pickleable defaultdict implementation
+    try:
+        return channels["default"]
+    except KeyError as e:
+        raise KeyError(
+            f"Could not find appropriate channel setting for {subject=} "
+            f"and {session=} in config.{variable_name}, set it explicitly "
+            'or set a default using the string key "default".'
+        ) from e
+
+
+def get_ecg_channel(
+    ecg_channel: str | dict[str, str],
+    subject: str = "",
+    session: str | None = "",
+) -> str:
+    out = _get_channels_generic(
+        ecg_channel,
+        subject,
+        session,
+        variable_name="ssp_ecg_channel",
+    )
+    assert isinstance(out, str)  # mypy
+    return out
+
+
+def get_eog_channels(
+    eog_channels: Sequence[str] | None | dict[str, Sequence[str] | None],
+    subject: str = "",
+    session: str | None = "",
+) -> Sequence[str] | None:
+    out = _get_channels_generic(
+        eog_channels,
+        subject,
+        session,
+        variable_name="eog_channels",
+    )
+    assert isinstance(out, Sequence | None)  # mypy
+    return out
 
 
 def sanitize_cond_name(cond: str) -> str:
@@ -726,8 +784,13 @@ def _validate_contrasts(contrasts: list[tuple[str, str] | dict[str, Any]]) -> No
             if len(contrast) != 2:
                 raise ValueError("Contrasts' tuples MUST be two conditions")
         elif isinstance(contrast, dict):
-            if not _set_keys_arbitrary_contrast.issubset(set(contrast.keys())):
-                raise ValueError(f"Missing key(s) in contrast {contrast}")
+            missing = ", ".join(
+                repr(m) for m in sorted(_set_keys_arbitrary_contrast - set(contrast))
+            )
+            if missing:
+                raise ValueError(
+                    f"Missing key{_pl(missing)} in contrast {contrast}: {missing}"
+                )
             if len(contrast["conditions"]) != len(contrast["weights"]):
                 raise ValueError(
                     f"Contrast {contrast['name']} has an "
@@ -810,3 +873,30 @@ def _proj_path(
         suffix="proj",
         check=False,
     )
+
+
+def _get_rank(
+    *,
+    cfg: SimpleNamespace,
+    subject: str,
+    session: str | None,
+    inst: mne.io.BaseRaw | mne.BaseEpochs | mne.Covariance,
+    info: mne.Info | None = None,
+    log: bool = True,
+) -> dict[str, int]:
+    if cfg.cov_rank == "info":
+        kwargs = dict(rank="info")
+        from_where = "from info"
+    else:
+        assert isinstance(cfg.cov_rank, dict)
+        kwargs = cfg.cov_rank
+        from_where = "compute from data"
+    if info is None:
+        assert not isinstance(inst, mne.Covariance)
+        info = inst.info
+    rank = mne.compute_rank(inst, info=info, **kwargs)
+    assert isinstance(rank, dict)
+    if log:
+        msg = f"Using rank {from_where}: {rank}"
+        logger.info(**gen_log_kwargs(message=msg))
+    return rank

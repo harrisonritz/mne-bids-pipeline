@@ -100,11 +100,14 @@ def average_evokeds(
             continue
         fname_in = in_files.pop(key)
         these_evokeds = mne.read_evokeds(fname_in)
+        assert isinstance(these_evokeds, list)
         for idx, evoked in enumerate(these_evokeds):
             evokeds_nested[idx].append(evoked)  # Insert into the container
 
     evokeds: list[mne.Evoked] = list()
     for these_evokeds in evokeds_nested:
+        if not these_evokeds:  # empty
+            continue
         evokeds.append(
             mne.grand_average(
                 these_evokeds, interpolate_bads=cfg.interpolate_bads_grand_average
@@ -129,6 +132,14 @@ def average_evokeds(
         root=cfg.deriv_root,
         check=False,
     )
+    # short-circuit, writing a dummy file (can be needed when no data present for a
+    # given missing run)
+    fname_verbose = fname_out.fpath.with_suffix(".fif.IS_INTENTIONALLY_EMPTY.txt")
+    if not evokeds:
+        fname_out.fpath.write_bytes(b"")
+        fname_verbose.write_text("No evoked data present for any subject.\n", "utf-8")
+        return _prep_out_files(exec_params=exec_params, out_files=out_files)
+    fname_verbose.unlink(missing_ok=True)  # should remove if previously written
 
     if not fname_out.fpath.parent.exists():
         os.makedirs(fname_out.fpath.parent)
@@ -350,18 +361,24 @@ def average_time_by_time_decoding(
         time_points_shape += (len(times),)
 
     n_subjects = len(cfg.subjects)
+    mean = np.empty(time_points_shape)
+    mean_min = np.empty(time_points_shape)
+    mean_max = np.empty(time_points_shape)
+    mean_se = np.empty(time_points_shape)
+    mean_ci_lower = np.empty(time_points_shape)
+    mean_ci_upper = np.empty(time_points_shape)
     contrast_score_stats = {
         "cond_1": cond_1,
         "cond_2": cond_2,
         "times": times,
         "N": n_subjects,
         "decim": dtg_decim,
-        "mean": np.empty(time_points_shape),
-        "mean_min": np.empty(time_points_shape),
-        "mean_max": np.empty(time_points_shape),
-        "mean_se": np.empty(time_points_shape),
-        "mean_ci_lower": np.empty(time_points_shape),
-        "mean_ci_upper": np.empty(time_points_shape),
+        "mean": mean,
+        "mean_min": mean_min,
+        "mean_max": mean_max,
+        "mean_se": mean_se,
+        "mean_ci_lower": mean_ci_lower,
+        "mean_ci_upper": mean_ci_upper,
         "cluster_all_times": np.array([]),
         "cluster_all_t_values": np.array([]),
         "cluster_t_threshold": np.nan,
@@ -433,9 +450,9 @@ def average_time_by_time_decoding(
     #
     # For time generalization, all values (each time point vs each other)
     # are considered.
-    contrast_score_stats["mean"][:] = mean_scores.mean(axis=0)
-    contrast_score_stats["mean_min"][:] = mean_scores.min(axis=0)
-    contrast_score_stats["mean_max"][:] = mean_scores.max(axis=0)
+    mean[:] = mean_scores.mean(axis=0)
+    mean_min[:] = mean_scores.min(axis=0)
+    mean_max[:] = mean_scores.max(axis=0)
 
     # Finally, for each time point, bootstrap the mean, and calculate the
     # SD of the bootstrapped distribution: this is the standard error of
@@ -454,9 +471,9 @@ def average_time_by_time_decoding(
         ci_lower = np.quantile(bootstrapped_means, q=0.025)
         ci_upper = np.quantile(bootstrapped_means, q=0.975)
 
-        contrast_score_stats["mean_se"][time_idx] = se
-        contrast_score_stats["mean_ci_lower"][time_idx] = ci_lower
-        contrast_score_stats["mean_ci_upper"][time_idx] = ci_upper
+        mean_se[time_idx] = se
+        mean_ci_lower[time_idx] = ci_lower
+        mean_ci_upper[time_idx] = ci_upper
 
         del bootstrapped_means, se, ci_lower, ci_upper
 
@@ -923,7 +940,7 @@ def _average_csp_time_freq(
     cfg: SimpleNamespace,
     subject: str,
     session: str | None,
-    data: pd.DataFrame,
+    data: list[pd.DataFrame],
 ) -> pd.DataFrame:
     # Prepare a dataframe for storing the results.
     grand_average = data[0].copy()
@@ -996,7 +1013,6 @@ def get_config(
         time_frequency_freq_max=config.time_frequency_freq_max,
         decode=config.decode,
         decoding_metric=config.decoding_metric,
-        decoding_n_splits=config.decoding_n_splits,
         decoding_time_generalization=config.decoding_time_generalization,
         decoding_time_generalization_decim=config.decoding_time_generalization_decim,
         decoding_csp=config.decoding_csp,
@@ -1023,15 +1039,19 @@ def get_config(
 
 
 def main(*, config: SimpleNamespace) -> None:
+    subject = "average"
     if config.task_is_rest:
-        msg = '    … skipping: for "rest" task.'
-        logger.info(**gen_log_kwargs(message=msg))
+        msg = 'Skipping, task is "rest" …'
+        logger.info(**gen_log_kwargs(message=msg, subject=subject))
         return
     cfg = get_config(
         config=config,
     )
     exec_params = config.exec_params
-    subject = "average"
+    if hasattr(exec_params.overrides, "subjects"):
+        msg = "Skipping, --subject is set …"
+        logger.info(**gen_log_kwargs(message=msg, subject=subject))
+        return
     sessions = get_sessions(config=config)
     if cfg.decode or cfg.decoding_csp:
         decoding_contrasts = get_decoding_contrasts(config=cfg)
@@ -1077,8 +1097,15 @@ def main(*, config: SimpleNamespace) -> None:
                 for session in sessions
             ]
             # Time-by-time
+            sc = [
+                (session, contrast)
+                for session in sessions
+                for contrast in decoding_contrasts
+            ]
             parallel, run_func = parallel_func(
-                average_time_by_time_decoding, exec_params=exec_params
+                average_time_by_time_decoding,
+                exec_params=exec_params,
+                n_iter=len(sc),
             )
             logs += parallel(
                 run_func(
@@ -1089,14 +1116,13 @@ def main(*, config: SimpleNamespace) -> None:
                     cond_1=contrast[0],
                     cond_2=contrast[1],
                 )
-                for session in sessions
-                for contrast in decoding_contrasts
+                for session, contrast in sc
             )
 
         # 3. CSP
         if cfg.decoding_csp and decoding_contrasts:
             parallel, run_func = parallel_func(
-                average_csp_decoding, exec_params=exec_params
+                average_csp_decoding, exec_params=exec_params, n_iter=len(sc)
             )
             logs += parallel(
                 run_func(
@@ -1107,8 +1133,7 @@ def main(*, config: SimpleNamespace) -> None:
                     cond_1=contrast[0],
                     cond_2=contrast[1],
                 )
-                for contrast in get_decoding_contrasts(config=cfg)
-                for session in sessions
+                for session, contrast in sc
             )
 
     save_logs(config=config, logs=logs)

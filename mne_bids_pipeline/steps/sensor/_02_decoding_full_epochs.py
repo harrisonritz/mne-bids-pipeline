@@ -23,10 +23,10 @@ from sklearn.pipeline import make_pipeline
 from mne_bids_pipeline._config_utils import (
     _bids_kwargs,
     _get_decoding_proc,
+    _get_ss,
     _restrict_analyze_channels,
     get_decoding_contrasts,
     get_eeg_reference,
-    get_subjects_sessions,
 )
 from mne_bids_pipeline._decoding import LogReg, _decoding_preproc_steps
 from mne_bids_pipeline._logging import gen_log_kwargs, logger
@@ -123,6 +123,7 @@ def run_epochs_decoding(
     )
     epochs.pick(pick_idx)
     pre_steps = _decoding_preproc_steps(
+        cfg=cfg,
         subject=subject,
         session=session,
         epochs=epochs,
@@ -137,11 +138,7 @@ def run_epochs_decoding(
     clf = make_pipeline(
         *pre_steps,
         Vectorizer(),
-        LogReg(
-            solver="liblinear",  # much faster than the default
-            random_state=cfg.random_state,
-            n_jobs=1,
-        ),
+        LogReg(random_state=cfg.random_state),
     )
 
     # Now, actually run the classification, and evaluate it via a
@@ -243,6 +240,7 @@ def get_config(
     cfg = SimpleNamespace(
         conditions=config.conditions,
         contrasts=get_decoding_contrasts(config),
+        cov_rank=config.cov_rank,
         decode=config.decode,
         decoding_which_epochs=config.decoding_which_epochs,
         decoding_metric=config.decoding_metric,
@@ -261,18 +259,23 @@ def get_config(
 def main(*, config: SimpleNamespace) -> None:
     """Run time-by-time decoding."""
     if not config.contrasts:
-        msg = "No contrasts specified; not performing decoding."
-        logger.info(**gen_log_kwargs(message=msg, emoji="skip"))
+        msg = "Skipping, no contrasts specified …"
+        logger.info(**gen_log_kwargs(message=msg))
         return
 
     if not config.decode:
-        msg = "No decoding requested by user."
-        logger.info(**gen_log_kwargs(message=msg, emoji="skip"))
+        logger.info(**gen_log_kwargs(message="SKIP"))
         return
 
+    ss = _get_ss(config=config)
+    sscc = [
+        (subject, session, cond_1, cond_2)
+        for subject, session in ss
+        for cond_1, cond_2 in get_decoding_contrasts(config)
+    ]
     with get_parallel_backend(config.exec_params):
         parallel, run_func = parallel_func(
-            run_epochs_decoding, exec_params=config.exec_params
+            run_epochs_decoding, exec_params=config.exec_params, n_iter=len(sscc)
         )
         logs = parallel(
             run_func(
@@ -283,8 +286,6 @@ def main(*, config: SimpleNamespace) -> None:
                 condition2=cond_2,
                 session=session,
             )
-            for subject, sessions in get_subjects_sessions(config).items()
-            for session in sessions
-            for (cond_1, cond_2) in get_decoding_contrasts(config)
+            for subject, session, cond_1, cond_2 in sscc
         )
     save_logs(config=config, logs=logs)
