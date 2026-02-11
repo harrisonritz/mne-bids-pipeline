@@ -113,12 +113,12 @@ def run_epochs_decoding(
     # metadata selection, so simply using epochs[conds[0], conds[1]] would
     # not work.
     if cfg.decoding_equalize:
-        epochs = mne.concatenate_epochs(
-            mne.epochs.equalize_epoch_counts(
-                [epochs[epochs_conds[0]], epochs[epochs_conds[1]]]
-            ),
-            verbose="error",
-        )
+        epochs1 = epochs[epochs_conds[0]]
+        epochs2 = epochs[epochs_conds[1]]
+        mne.epochs.equalize_epoch_counts([epochs1, epochs2])
+
+        epochs = mne.concatenate_epochs([epochs1, epochs2], verbose="error")
+        del epochs1, epochs2
     else:
         epochs = mne.concatenate_epochs(
             [epochs[epochs_conds[0]], epochs[epochs_conds[1]]], verbose="error"

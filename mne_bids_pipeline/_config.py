@@ -1867,7 +1867,7 @@ all groups except one, which will be used for testing. This process will be repe
 until each group has been used as the test set once.
 """
 
-decoding_baseline: bool = False
+decoding_baseline: tuple[float, float] | None = None
 """
 Whether to perform baseline decoding. This means that the decoding will be performed
 on the baseline period of the epochs, which is typically a time window before the
