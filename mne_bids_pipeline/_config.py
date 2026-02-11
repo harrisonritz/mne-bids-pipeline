@@ -1867,6 +1867,23 @@ all groups except one, which will be used for testing. This process will be repe
 until each group has been used as the test set once.
 """
 
+decoding_baseline: bool = False
+"""
+Whether to perform baseline decoding. This means that the decoding will be performed
+on the baseline period of the epochs, which is typically a time window before the
+event onset. This can be useful to check if there are any differences between conditions
+before the event of interest, which could indicate confounding factors or biases in the
+data.
+"""
+
+decoding_equalize: bool = True
+"""
+Whether to equalize the number of epochs in each condition before decoding. This is
+done by randomly selecting a subset of epochs from the condition with more epochs, so
+that both conditions have the same number of epochs. This can help to prevent bias in
+the decoding results due to imbalanced class sizes.
+"""
+
 
 decoding_time_generalization: bool = False
 """
