@@ -53,8 +53,8 @@ from mne_bids_pipeline._run import (
 )
 from mne_bids_pipeline.typing import InFilesT, OutFilesT
 
+N_JOBS = -1
 
-N_JOBS=-1
 
 def get_input_fnames_time_decoding(
     *,
@@ -136,6 +136,12 @@ def run_time_decoding(
         epochs.info, meg=True, eeg=True, ref_meg=False, exclude="bads"
     )
     epochs.pick(pick_idx)
+
+    # apply baseline
+    if cfg.decoding_baseline is not None:
+        print(f"Applying baseline correction for decoding: {cfg.decoding_baseline}")
+        epochs.apply_baseline(cfg.decoding_baseline)
+
     # We can't use the full rank here because the number of samples can just be the
     # number of epochs (which can be fewer than the number of channels)
     pre_steps = _decoding_preproc_steps(
@@ -343,6 +349,7 @@ def get_config(
         decoding_time_generalization_decim=config.decoding_time_generalization_decim,  # noqa: E501
         decoding_LOGO=config.decoding_LOGO,
         decoding_LOGO_group=config.decoding_LOGO_group,
+        decoding_baseline=config.decoding_baseline,
         random_state=config.random_state,
         analyze_channels=config.analyze_channels,
         ch_types=config.ch_types,

@@ -45,8 +45,7 @@ from mne_bids_pipeline._run import (
 )
 from mne_bids_pipeline.typing import InFilesT, OutFilesT
 
-
-N_JOBS=-1
+N_JOBS = -1
 
 
 def get_input_fnames_epochs_decoding(
@@ -120,6 +119,11 @@ def run_epochs_decoding(
     # Crop to the desired analysis interval. Do it only after the concatenation to work
     # around https://github.com/mne-tools/mne-python/issues/12153
     epochs.crop(cfg.decoding_epochs_tmin, cfg.decoding_epochs_tmax)
+
+    if cfg.decoding_baseline is not None:
+        print(f"Applying baseline correction for decoding: {cfg.decoding_baseline}")
+        epochs.apply_baseline(cfg.decoding_baseline)
+
     # omit bad channels and reference MEG sensors
     pick_idx = mne.pick_types(
         epochs.info, meg=True, eeg=True, ref_meg=False, exclude="bads"
@@ -148,7 +152,10 @@ def run_epochs_decoding(
     # cross-validation procedure.
     if cfg.decoding_LOGO:
         # number of unique groups
-        print(f"Unique groups for LOGO: {epochs.metadata[cfg.decoding_LOGO_group].unique()}")
+        print(
+            f"Unique groups for LOGO: \
+                {epochs.metadata[cfg.decoding_LOGO_group].unique()}"
+        )
         scores = cross_val_score(
             estimator=clf,
             X=X,
@@ -267,6 +274,7 @@ def get_config(
         decoding_n_splits=config.decoding_n_splits,
         decoding_LOGO=config.decoding_LOGO,
         decoding_LOGO_group=config.decoding_LOGO_group,
+        decoding_baseline=config.decoding_baseline,
         random_state=config.random_state,
         analyze_channels=config.analyze_channels,
         ch_types=config.ch_types,
