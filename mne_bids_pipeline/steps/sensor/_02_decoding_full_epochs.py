@@ -145,6 +145,7 @@ def run_epochs_decoding(
     # cross-validation procedure.
     if cfg.decoding_LOGO:
         # number of unique groups
+        print(f"Unique groups for LOGO: {epochs.metadata[cfg.decoding_LOGO_group].unique()}")
         scores = cross_val_score(
             estimator=clf,
             X=X,
