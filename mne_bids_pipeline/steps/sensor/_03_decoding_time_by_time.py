@@ -129,7 +129,17 @@ def run_time_decoding(
     # We have to use this approach because the conditions could be based on
     # metadata selection, so simply using epochs[conds[0], conds[1]] would
     # not work.
-    epochs = mne.concatenate_epochs([epochs[epochs_conds[0]], epochs[epochs_conds[1]]])
+    if cfg.decoding_equalize:
+        epochs = mne.concatenate_epochs(
+            mne.epochs.equalize_epoch_counts(
+                [epochs[epochs_conds[0]], epochs[epochs_conds[1]]]
+            ),
+            verbose="error",
+        )
+    else:
+        epochs = mne.concatenate_epochs(
+            [epochs[epochs_conds[0]], epochs[epochs_conds[1]]], verbose="error"
+        )
     n_cond1 = len(epochs[epochs_conds[0]])
     n_cond2 = len(epochs[epochs_conds[1]])
     pick_idx = mne.pick_types(
@@ -350,6 +360,7 @@ def get_config(
         decoding_LOGO=config.decoding_LOGO,
         decoding_LOGO_group=config.decoding_LOGO_group,
         decoding_baseline=config.decoding_baseline,
+        decoding_equalize=config.decoding_equalize,
         random_state=config.random_state,
         analyze_channels=config.analyze_channels,
         ch_types=config.ch_types,
