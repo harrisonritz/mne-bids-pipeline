@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import mne
 import numpy as np
 import pandas as pd
-from mne.decoding import Vectorizer
+from mne.decoding import LinearModel, Vectorizer, get_coef
 from mne_bids import BIDSPath
 from scipy.io import loadmat, savemat
 from sklearn.model_selection import LeaveOneGroupOut, StratifiedKFold, cross_val_score
@@ -214,6 +214,40 @@ def run_epochs_decoding(
     tabular_data = pd.DataFrame(tabular_data).T
     tabular_data.to_csv(out_files[tsv_key], sep="\t", index=False)
 
+    # Fit once on all data to get patterns/filters in channel space.
+    clf = make_pipeline(
+        *pre_steps,
+        Vectorizer(),
+        LinearModel(LogReg(random_state=cfg.random_state)),
+    )
+    clf.fit(X, y)
+    n_ch, n_times = X.shape[1], X.shape[2]
+    patterns = get_coef(clf, attr="patterns_", inverse_transform=True)
+    filters = get_coef(clf, attr="filters_", inverse_transform=True)
+    patterns = patterns.reshape(n_ch, n_times)
+    filters = filters.reshape(n_ch, n_times)
+
+    weights_processing = f"{processing}+weights"
+    weights_processing = weights_processing.replace("_", "-").replace("-", "")
+    weights_key = f"tsv_weights_{weights_processing}"
+    out_files[weights_key] = bids_path.copy().update(
+        suffix="decoding", processing=weights_processing, extension=".tsv"
+    )
+
+    weights_frames = []
+    for kind, coef in ("patterns", patterns), ("filters", filters):
+        df = pd.DataFrame(coef, index=epochs.ch_names, columns=epochs.times)
+        df.index.name = "ch_name"
+        df = df.reset_index().melt(
+            id_vars="ch_name",
+            var_name="time",
+            value_name="value",
+        )
+        df.insert(0, "kind", kind)
+        weights_frames.append(df)
+    weights_df = pd.concat(weights_frames, ignore_index=True)
+    weights_df.to_csv(out_files[weights_key], sep="\t", index=False)
+
     # Report
     with _open_report(
         cfg=cfg, exec_params=exec_params, subject=subject, session=session
@@ -261,6 +295,42 @@ def run_epochs_decoding(
         )
         # close figure to save memory
         plt.close(fig)
+
+        for ch_type in ("mag", "grad", "eeg"):
+            picks = mne.pick_types(
+                epochs.info,
+                meg=ch_type if ch_type in ("mag", "grad") else False,
+                eeg=ch_type == "eeg",
+                exclude=(),
+            )
+            if len(picks) == 0:
+                continue
+            info = mne.pick_info(epochs.info, picks)
+            for kind, coef in ("patterns", patterns), ("filters", filters):
+                evoked = mne.EvokedArray(coef[picks], info, tmin=epochs.tmin)
+                fig = evoked.plot_topomap(times="auto", show=False, ch_type=ch_type)
+                report.add_figure(
+                    fig=fig,
+                    title=f"Full-epochs {kind} ({ch_type})",
+                    caption=(
+                        "Topographic maps for full-epochs decoding, derived from "
+                        "channel-space coefficients."
+                    ),
+                    section="Decoding: full-epochs",
+                    tags=(
+                        "epochs",
+                        "contrast",
+                        "decoding",
+                        kind,
+                        ch_type,
+                        *[
+                            f"{_sanitize_cond_tag(cond_1)}–{_sanitize_cond_tag(cond_2)}"
+                            for cond_1, cond_2 in cfg.contrasts
+                        ],
+                    ),
+                    replace=True,
+                )
+                plt.close(fig)
 
     assert len(in_files) == 0, in_files.keys()
     return _prep_out_files(exec_params=exec_params, out_files=out_files)
