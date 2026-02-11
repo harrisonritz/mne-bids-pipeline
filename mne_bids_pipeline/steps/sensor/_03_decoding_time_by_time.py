@@ -54,6 +54,8 @@ from mne_bids_pipeline._run import (
 from mne_bids_pipeline.typing import InFilesT, OutFilesT
 
 
+N_JOBS=-1
+
 def get_input_fnames_time_decoding(
     *,
     cfg: SimpleNamespace,
@@ -182,7 +184,7 @@ def run_time_decoding(
             estimator = SlidingEstimator(
                 clf,
                 scoring=cfg.decoding_metric,
-                n_jobs=1,
+                n_jobs=N_JOBS,
             )
             cv_scoring_n_jobs = exec_params.n_jobs
 

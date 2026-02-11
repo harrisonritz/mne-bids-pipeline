@@ -46,6 +46,9 @@ from mne_bids_pipeline._run import (
 from mne_bids_pipeline.typing import InFilesT, OutFilesT
 
 
+N_JOBS=-1
+
+
 def get_input_fnames_epochs_decoding(
     *,
     cfg: SimpleNamespace,
@@ -153,7 +156,7 @@ def run_epochs_decoding(
             cv=LeaveOneGroupOut(),
             groups=epochs.metadata[cfg.decoding_LOGO_group].values,
             scoring="roc_auc",
-            n_jobs=1,
+            n_jobs=N_JOBS,
             error_score="raise",
         )
 
@@ -169,7 +172,7 @@ def run_epochs_decoding(
             y=y,
             cv=cv,
             scoring="roc_auc",
-            n_jobs=1,
+            n_jobs=N_JOBS,
             error_score="raise",
         )
 

@@ -36,6 +36,7 @@ from mne_bids_pipeline._run import (
 )
 from mne_bids_pipeline.typing import InFilesT, OutFilesT
 
+N_JOBS=-1
 
 def get_input_fnames_run_ica(
     *,
@@ -154,7 +155,7 @@ def run_ica(
             del nyq
 
         if cfg.ica_l_freq is not None or h_freq is not None:
-            raw.filter(l_freq=cfg.ica_l_freq, h_freq=h_freq, n_jobs=1)
+            raw.filter(l_freq=cfg.ica_l_freq, h_freq=h_freq, n_jobs=N_JOBS)
 
         # Only keep the subset of the mapping that applies to the current run
         event_id = event_name_to_code_map.copy()
