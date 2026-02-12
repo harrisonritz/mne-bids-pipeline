@@ -45,7 +45,7 @@ from mne_bids_pipeline._run import (
 )
 from mne_bids_pipeline.typing import InFilesT, OutFilesT
 
-N_JOBS = -1
+N_JOBS = 1
 
 
 def get_input_fnames_epochs_decoding(
@@ -137,6 +137,7 @@ def run_epochs_decoding(
         epochs.info, meg=True, eeg=True, ref_meg=False, exclude="bads"
     )
     epochs.pick(pick_idx)
+    print("channels: ", epochs.ch_names)
     pre_steps = _decoding_preproc_steps(
         cfg=cfg,
         subject=subject,

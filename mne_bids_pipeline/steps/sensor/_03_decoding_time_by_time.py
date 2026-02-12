@@ -146,7 +146,7 @@ def run_time_decoding(
         epochs.info, meg=True, eeg=True, ref_meg=False, exclude="bads"
     )
     epochs.pick(pick_idx)
-
+    print("channels: ", epochs.ch_names)
     # apply baseline
     if cfg.decoding_baseline is not None:
         print(f"Applying baseline correction for decoding: {cfg.decoding_baseline}")
@@ -183,12 +183,6 @@ def run_time_decoding(
             Vectorizer(),
             LogReg(random_state=cfg.random_state),
         )
-        cv = StratifiedKFold(
-            shuffle=True,
-            random_state=cfg.random_state,
-            n_splits=cfg.decoding_n_splits,
-        )
-
         if cfg.decoding_time_generalization:
             estimator = GeneralizingEstimator(
                 clf,
@@ -212,10 +206,15 @@ def run_time_decoding(
                 cv=LeaveOneGroupOut(),
                 groups=epochs.metadata[cfg.decoding_LOGO_group].values,
                 n_jobs=cv_scoring_n_jobs,
-                verbose=verbose,  # ensure ProgressBar is shown (can be slow)
+                verbose=False,  # ensure ProgressBar is shown (can be slow)
             )
 
         else:
+            cv = StratifiedKFold(
+                shuffle=True,
+                random_state=cfg.random_state,
+                n_splits=cfg.decoding_n_splits,
+            )
             scores = cross_val_multiscore(
                 estimator,
                 X=X,
