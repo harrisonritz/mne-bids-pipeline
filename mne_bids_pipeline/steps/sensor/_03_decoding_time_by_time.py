@@ -20,13 +20,14 @@ import pandas as pd
 from mne.decoding import (
     GeneralizingEstimator,
     SlidingEstimator,
-    Vectorizer,
     cross_val_multiscore,
 )
 from mne_bids import BIDSPath
 from scipy.io import loadmat, savemat
+from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import LeaveOneGroupOut, StratifiedKFold
 from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
 from mne_bids_pipeline._config_utils import (
     _bids_kwargs,
@@ -36,7 +37,7 @@ from mne_bids_pipeline._config_utils import (
     get_eeg_reference,
     get_subjects_sessions,
 )
-from mne_bids_pipeline._decoding import LogReg, _decoding_preproc_steps
+from mne_bids_pipeline._decoding import _decoding_preproc_steps
 from mne_bids_pipeline._logging import gen_log_kwargs, logger
 from mne_bids_pipeline._parallel import get_parallel_backend, get_parallel_backend_name
 from mne_bids_pipeline._report import (
@@ -154,7 +155,7 @@ def run_time_decoding(
 
     # We can't use the full rank here because the number of samples can just be the
     # number of epochs (which can be fewer than the number of channels)
-    pre_steps = _decoding_preproc_steps(
+    _decoding_preproc_steps(
         cfg=cfg,
         subject=subject,
         session=session,
@@ -178,10 +179,14 @@ def run_time_decoding(
     # ProgressBar does not work on dask, so only enable it if not using dask
     verbose = get_parallel_backend_name(exec_params=exec_params) != "dask"
     with get_parallel_backend(exec_params):
+        # clf = make_pipeline(
+        #     *pre_steps,
+        #     Vectorizer(),
+        #     LogReg(random_state=cfg.random_state),
+        # )
         clf = make_pipeline(
-            *pre_steps,
-            Vectorizer(),
-            LogReg(random_state=cfg.random_state),
+            StandardScaler(),
+            LogisticRegression(solver="liblinear"),
         )
         if cfg.decoding_time_generalization:
             estimator = GeneralizingEstimator(

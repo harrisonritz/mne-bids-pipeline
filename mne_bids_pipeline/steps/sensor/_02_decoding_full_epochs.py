@@ -14,11 +14,13 @@ from types import SimpleNamespace
 import mne
 import numpy as np
 import pandas as pd
-from mne.decoding import LinearModel, Vectorizer, get_coef
+from mne.decoding import LinearModel, get_coef
 from mne_bids import BIDSPath
 from scipy.io import loadmat, savemat
+from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import LeaveOneGroupOut, StratifiedKFold, cross_val_score
 from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
 from mne_bids_pipeline._config_utils import (
     _bids_kwargs,
@@ -28,7 +30,7 @@ from mne_bids_pipeline._config_utils import (
     get_decoding_contrasts,
     get_eeg_reference,
 )
-from mne_bids_pipeline._decoding import LogReg, _decoding_preproc_steps
+from mne_bids_pipeline._decoding import _decoding_preproc_steps
 from mne_bids_pipeline._logging import gen_log_kwargs, logger
 from mne_bids_pipeline._parallel import get_parallel_backend, parallel_func
 from mne_bids_pipeline._report import (
@@ -138,7 +140,7 @@ def run_epochs_decoding(
     )
     epochs.pick(pick_idx)
     print("channels: ", epochs.ch_names)
-    pre_steps = _decoding_preproc_steps(
+    _decoding_preproc_steps(
         cfg=cfg,
         subject=subject,
         session=session,
@@ -151,10 +153,14 @@ def run_epochs_decoding(
     X = epochs.get_data()
     y = np.r_[np.ones(n_cond1), np.zeros(n_cond2)]
 
+    # clf = make_pipeline(
+    #     *pre_steps,
+    #     Vectorizer(),
+    #     LogReg(random_state=cfg.random_state),
+    # )
     clf = make_pipeline(
-        *pre_steps,
-        Vectorizer(),
-        LogReg(random_state=cfg.random_state),
+        StandardScaler(),
+        LogisticRegression(solver="liblinear"),
     )
 
     # Now, actually run the classification, and evaluate it via a
@@ -216,10 +222,14 @@ def run_epochs_decoding(
     tabular_data.to_csv(out_files[tsv_key], sep="\t", index=False)
 
     # Fit once on all data to get patterns/filters in channel space.
+    # clf = make_pipeline(
+    #     *pre_steps,
+    #     Vectorizer(),
+    #     LinearModel(LogReg(random_state=cfg.random_state)),
+    # )
     clf = make_pipeline(
-        *pre_steps,
-        Vectorizer(),
-        LinearModel(LogReg(random_state=cfg.random_state)),
+        StandardScaler(),
+        LinearModel(LogisticRegression(solver="liblinear")),
     )
     clf.fit(X, y)
     n_ch, n_times = X.shape[1], X.shape[2]
