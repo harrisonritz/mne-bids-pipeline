@@ -415,6 +415,13 @@ def find_ica_artifacts(
                 out_files[f"ica_properties_{pick:03d}"] = fig_path
                 plt.close(fig)
 
+        # save sensor names for matching to scores
+        sensor_names_path = _ica_fig_path(
+            bids_basename_for_figs, ica_out_dir, "ica", "sensorNames", ".tsv"
+        )
+        pd.DataFrame({"sensor": ica.ch_names}).to_csv(sensor_names_path, sep="\t", index=False)
+        out_files["ica_sensor_names"] = sensor_names_path
+
         # --- ECG scores ---
         if len(ecg_scores) > 0:
             fig = ica.plot_scores(scores=ecg_scores, labels="ecg", show=False)
