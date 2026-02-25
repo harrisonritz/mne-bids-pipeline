@@ -7,6 +7,7 @@ To actually remove designated ICA components from your data, you will have to
 run the apply_ica step.
 """
 
+import pathlib
 from types import SimpleNamespace
 from typing import Literal
 
@@ -26,9 +27,9 @@ from mne_bids_pipeline._config_utils import (
 )
 from mne_bids_pipeline._logging import gen_log_kwargs, logger
 from mne_bids_pipeline._parallel import get_parallel_backend, parallel_func
-from mne_bids_pipeline._report import _open_report
+from mne_bids_pipeline._report import _agg_backend
 from mne_bids_pipeline._run import (
-    _prep_out_files,
+    _prep_out_files_path,
     _update_for_splits,
     failsafe_run,
     save_logs,
@@ -36,6 +37,21 @@ from mne_bids_pipeline._run import (
 from mne_bids_pipeline.typing import FloatArrayT, InFilesT, OutFilesT
 
 N_JOBS=-1
+
+
+def _ica_fig_path(
+    bids_basename: BIDSPath,
+    ica_out_dir: pathlib.Path,
+    processing: str,
+    suffix: str,
+    extension: str = ".png",
+) -> pathlib.Path:
+    """Build a BIDS-style filename in the ICA output directory."""
+    bp = bids_basename.copy().update(
+        processing=processing, suffix=suffix, extension=extension
+    )
+    return ica_out_dir / bp.basename
+
 
 def detect_bad_components(
     *,
@@ -148,6 +164,11 @@ def find_ica_artifacts(
     out_files_components = bids_basename.copy().update(
         processing="ica", suffix="components", extension=".tsv"
     )
+
+    # ICA figure/array output directory
+    ica_out_dir = out_files["ica"].fpath.parent / "ICA"
+    ica_out_dir.mkdir(exist_ok=True, parents=True)
+    bids_basename_for_figs = bids_basename.copy()
     del bids_basename
     msg = "Loading ICA solution"
     logger.info(**gen_log_kwargs(message=msg))
@@ -357,39 +378,103 @@ def find_ica_artifacts(
 
     del artifact_name, artifact_evoked
 
-    title = "ICA: components"
-    tags = ("ica",)
-    with _open_report(
-        cfg=cfg,
-        exec_params=exec_params,
-        subject=subject,
-        session=session,
-        task=cfg.task,
-    ) as report:
-        logger.info(**gen_log_kwargs(message=f'Adding "{title}" to report.'))
-        report.add_ica(
-            ica=ica,
-            title=title,
-            inst=epochs,
-            ecg_evoked=ecg_evoked,
-            eog_evoked=eog_evoked,
-            ecg_scores=ecg_scores if len(ecg_scores) else None,
-            eog_scores=eog_scores if len(eog_scores) else None,
-            replace=True,
-            n_jobs=N_JOBS,  # avoid automatic parallelization
-            tags=tags,
-        )
+    # Export ICA figures as PNGs and scores as NPY arrays
+    logger.info(**gen_log_kwargs(message="Saving ICA figures to PNG files."))
+    with _agg_backend():
+        import matplotlib.pyplot as plt
 
-        if cfg.ica_use_icalabel:
-            _add_report_icalabel(
-                report=report,
-                ica=ica,
-                icalabel_report=icalabel_report,
-                icalabel_df=icalabel_df,
-                tags=tags,
-                subject=subject,
-                session=session,
+        # --- Component topographies ---
+        figs = ica.plot_components(colorbar=True, show=False)
+        if not isinstance(figs, list):
+            figs = [figs]
+        for fi, fig in enumerate(figs):
+            suffix = "icaComponents" if fi == 0 else f"icaComponents{fi + 1}"
+            fig_path = _ica_fig_path(
+                bids_basename_for_figs, ica_out_dir, "ica", suffix
             )
+            fig.savefig(fig_path, dpi=150, bbox_inches="tight")
+            out_files[f"ica_components_{fi}"] = fig_path
+            plt.close(fig)
+
+        # --- Component properties ---
+        if cfg.ica_plot_component_properties == "all":
+            props_picks = list(range(ica.n_components_))
+        else:  # "excluded"
+            props_picks = list(ica.exclude)
+
+        for pick in props_picks:
+            figs_props = ica.plot_properties(inst=epochs, picks=pick, show=False)
+            if not isinstance(figs_props, list):
+                figs_props = [figs_props]
+            for fig in figs_props:
+                suffix = f"icaProperties{pick:03d}"
+                fig_path = _ica_fig_path(
+                    bids_basename_for_figs, ica_out_dir, "ica", suffix
+                )
+                fig.savefig(fig_path, dpi=150, bbox_inches="tight")
+                out_files[f"ica_properties_{pick:03d}"] = fig_path
+                plt.close(fig)
+
+        # --- ECG scores ---
+        if len(ecg_scores) > 0:
+            fig = ica.plot_scores(scores=ecg_scores, labels="ecg", show=False)
+            fig_path = _ica_fig_path(
+                bids_basename_for_figs, ica_out_dir, "ica+ecg", "icaScores"
+            )
+            fig.savefig(fig_path, dpi=150, bbox_inches="tight")
+            out_files["ica_ecg_scores_fig"] = fig_path
+            plt.close(fig)
+
+            npy_path = _ica_fig_path(
+                bids_basename_for_figs, ica_out_dir, "ica+ecg", "icaScores", ".npy"
+            )
+            np.save(npy_path, ecg_scores)
+            out_files["ica_ecg_scores_npy"] = npy_path
+
+        # --- EOG scores ---
+        if len(eog_scores) > 0:
+            fig = ica.plot_scores(scores=eog_scores, labels="eog", show=False)
+            fig_path = _ica_fig_path(
+                bids_basename_for_figs, ica_out_dir, "ica+eog", "icaScores"
+            )
+            fig.savefig(fig_path, dpi=150, bbox_inches="tight")
+            out_files["ica_eog_scores_fig"] = fig_path
+            plt.close(fig)
+
+            npy_path = _ica_fig_path(
+                bids_basename_for_figs, ica_out_dir, "ica+eog", "icaScores", ".npy"
+            )
+            np.save(npy_path, eog_scores)
+            out_files["ica_eog_scores_npy"] = npy_path
+
+        # --- ECG sources ---
+        if ecg_evoked is not None:
+            fig = ica.plot_sources(inst=ecg_evoked, show=False)
+            fig_path = _ica_fig_path(
+                bids_basename_for_figs, ica_out_dir, "ica+ecg", "icaSources"
+            )
+            fig.savefig(fig_path, dpi=150, bbox_inches="tight")
+            out_files["ica_ecg_sources_fig"] = fig_path
+            plt.close(fig)
+
+        # --- EOG sources ---
+        if eog_evoked is not None:
+            fig = ica.plot_sources(inst=eog_evoked, show=False)
+            fig_path = _ica_fig_path(
+                bids_basename_for_figs, ica_out_dir, "ica+eog", "icaSources"
+            )
+            fig.savefig(fig_path, dpi=150, bbox_inches="tight")
+            out_files["ica_eog_sources_fig"] = fig_path
+            plt.close(fig)
+
+        # --- ICA overlay (original vs cleaned signal) ---
+        fig = ica.plot_overlay(inst=epochs, show=False, on_baseline="reapply")
+        fig_path = _ica_fig_path(
+            bids_basename_for_figs, ica_out_dir, "ica", "icaOverlay"
+        )
+        fig.savefig(fig_path, dpi=150, bbox_inches="tight")
+        out_files["ica_overlay_fig"] = fig_path
+        plt.close(fig)
 
     msg = 'Carefully review the extracted ICs and mark components "bad" in:'
     logger.info(**gen_log_kwargs(message=msg, emoji="🛑"))
@@ -587,6 +672,7 @@ def get_config(
         ica_icalabel_include=config.ica_icalabel_include,
         ica_exclusion_thresholds=config.ica_exclusion_thresholds,
         ica_class_thresholds=config.ica_class_thresholds,
+        ica_plot_component_properties=config.ica_plot_component_properties,
         ch_types=config.ch_types,
         eeg_reference=get_eeg_reference(config),
         eog_channels=config.eog_channels,

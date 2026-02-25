@@ -1545,6 +1545,15 @@ that more ICs will be identified as EOG-related. If too low, the
 false-alarm rate increases dramatically.
 """
 
+ica_plot_component_properties: Literal["all", "excluded"] = "excluded"
+"""
+Controls which ICA components have their properties plotted as individual
+PNG files during artifact detection.
+
+- ``"all"``: Plot properties for every component.
+- ``"excluded"``: Only plot properties for components marked for exclusion.
+"""
+
 ica_use_icalabel: bool = False
 """
 Whether to use MNE-ICALabel to automatically label ICA components. Only available for
