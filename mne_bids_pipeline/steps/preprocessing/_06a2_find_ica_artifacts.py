@@ -393,7 +393,6 @@ def find_ica_artifacts(
                 bids_basename_for_figs, ica_out_dir, "ica", suffix
             )
             fig.savefig(fig_path, dpi=150, bbox_inches="tight")
-            out_files[f"ica_components_{fi}"] = fig_path
             plt.close(fig)
 
         # --- Component properties ---
@@ -412,7 +411,6 @@ def find_ica_artifacts(
                     bids_basename_for_figs, ica_out_dir, "ica", suffix
                 )
                 fig.savefig(fig_path, dpi=150, bbox_inches="tight")
-                out_files[f"ica_properties_{pick:03d}"] = fig_path
                 plt.close(fig)
 
         # save sensor names for matching to scores
@@ -420,7 +418,6 @@ def find_ica_artifacts(
             bids_basename_for_figs, ica_out_dir, "ica", "sensorNames", ".tsv"
         )
         pd.DataFrame({"sensor": ica.ch_names}).to_csv(sensor_names_path, sep="\t", index=False)
-        out_files["ica_sensor_names"] = sensor_names_path
 
         # --- ECG scores ---
         if len(ecg_scores) > 0:
@@ -429,14 +426,12 @@ def find_ica_artifacts(
                 bids_basename_for_figs, ica_out_dir, "ica+ecg", "icaScores"
             )
             fig.savefig(fig_path, dpi=150, bbox_inches="tight")
-            out_files["ica_ecg_scores_fig"] = fig_path
             plt.close(fig)
 
             npy_path = _ica_fig_path(
                 bids_basename_for_figs, ica_out_dir, "ica+ecg", "icaScores", ".npy"
             )
             np.save(npy_path, ecg_scores)
-            out_files["ica_ecg_scores_npy"] = npy_path
 
         # --- EOG scores ---
         if len(eog_scores) > 0:
@@ -445,14 +440,12 @@ def find_ica_artifacts(
                 bids_basename_for_figs, ica_out_dir, "ica+eog", "icaScores"
             )
             fig.savefig(fig_path, dpi=150, bbox_inches="tight")
-            out_files["ica_eog_scores_fig"] = fig_path
             plt.close(fig)
 
             npy_path = _ica_fig_path(
                 bids_basename_for_figs, ica_out_dir, "ica+eog", "icaScores", ".npy"
             )
             np.save(npy_path, eog_scores)
-            out_files["ica_eog_scores_npy"] = npy_path
 
         # --- ECG sources ---
         if ecg_evoked is not None:
@@ -461,7 +454,6 @@ def find_ica_artifacts(
                 bids_basename_for_figs, ica_out_dir, "ica+ecg", "icaSources"
             )
             fig.savefig(fig_path, dpi=150, bbox_inches="tight")
-            out_files["ica_ecg_sources_fig"] = fig_path
             plt.close(fig)
 
         # --- EOG sources ---
@@ -471,7 +463,6 @@ def find_ica_artifacts(
                 bids_basename_for_figs, ica_out_dir, "ica+eog", "icaSources"
             )
             fig.savefig(fig_path, dpi=150, bbox_inches="tight")
-            out_files["ica_eog_sources_fig"] = fig_path
             plt.close(fig)
 
         # --- ICA overlay (original vs cleaned signal) ---
@@ -480,7 +471,6 @@ def find_ica_artifacts(
             bids_basename_for_figs, ica_out_dir, "ica", "icaOverlay"
         )
         fig.savefig(fig_path, dpi=150, bbox_inches="tight")
-        out_files["ica_overlay_fig"] = fig_path
         plt.close(fig)
 
     msg = 'Carefully review the extracted ICs and mark components "bad" in:'
