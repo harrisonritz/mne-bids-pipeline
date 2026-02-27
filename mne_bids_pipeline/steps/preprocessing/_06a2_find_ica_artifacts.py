@@ -29,7 +29,7 @@ from mne_bids_pipeline._logging import gen_log_kwargs, logger
 from mne_bids_pipeline._parallel import get_parallel_backend, parallel_func
 from mne_bids_pipeline._report import _agg_backend
 from mne_bids_pipeline._run import (
-    _prep_out_files_path,
+    _prep_out_files,
     _update_for_splits,
     failsafe_run,
     save_logs,
