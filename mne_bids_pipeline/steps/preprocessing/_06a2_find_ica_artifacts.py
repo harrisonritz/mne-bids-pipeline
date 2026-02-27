@@ -475,7 +475,7 @@ def find_ica_artifacts(
             plt.close(fig)
 
         # --- ICA overlay (original vs cleaned signal) ---
-        fig = ica.plot_overlay(inst=epochs, show=False, on_baseline="reapply")
+        fig = ica.plot_overlay(inst=epochs.average(), show=False, on_baseline="reapply")
         fig_path = _ica_fig_path(
             bids_basename_for_figs, ica_out_dir, "ica", "icaOverlay"
         )
