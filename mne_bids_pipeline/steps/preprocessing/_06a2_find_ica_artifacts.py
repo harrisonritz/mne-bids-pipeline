@@ -419,6 +419,22 @@ def find_ica_artifacts(
         )
         pd.DataFrame({"sensor": ica.ch_names}).to_csv(sensor_names_path, sep="\t", index=False)
 
+        # --- IC sensor maps (mixing matrix topographies) ---
+        ic_maps = ica.get_components()  # [n_channels, n_components]
+        ic_labels = [f"IC{i:03d}" for i in range(ica.n_components_)]
+        ic_maps_df = pd.DataFrame(
+            ic_maps, columns=ic_labels, index=ica.ch_names
+        )
+        ic_maps_path = _ica_fig_path(
+            bids_basename_for_figs, ica_out_dir, "ica", "icaSensorMaps", ".tsv"
+        )
+        ic_maps_df.to_csv(ic_maps_path, sep="\t", index_label="sensor")
+
+        # Z-score sensor maps per IC (across channels) for weighted maps
+        ic_std = ic_maps.std(axis=0, keepdims=True)
+        ic_std[ic_std == 0] = 1  # avoid division by zero
+        ic_maps_z = (ic_maps - ic_maps.mean(axis=0, keepdims=True)) / ic_std
+
         # --- ECG scores ---
         if len(ecg_scores) > 0:
             fig = ica.plot_scores(scores=ecg_scores, labels="ecg", show=False)
@@ -428,10 +444,30 @@ def find_ica_artifacts(
             fig.savefig(fig_path, dpi=150, bbox_inches="tight")
             plt.close(fig)
 
-            npy_path = _ica_fig_path(
-                bids_basename_for_figs, ica_out_dir, "ica+ecg", "icaScores", ".npy"
+            # Save ECG scores as TSV [n_IC, 1]
+            ecg_scores_1d = ecg_scores.ravel()
+            ecg_scores_df = pd.DataFrame(
+                {"score": ecg_scores_1d}, index=ic_labels
             )
-            np.save(npy_path, ecg_scores)
+            ecg_scores_df.index.name = "component"
+            tsv_path = _ica_fig_path(
+                bids_basename_for_figs, ica_out_dir, "ica+ecg", "icaScores", ".tsv"
+            )
+            ecg_scores_df.to_csv(tsv_path, sep="\t")
+
+            # Save score-weighted z-scored sensor maps [n_channels, n_IC]
+            ecg_weighted = ic_maps_z * ecg_scores_1d[np.newaxis, :]
+            ecg_weighted_df = pd.DataFrame(
+                ecg_weighted, columns=ic_labels, index=ica.ch_names
+            )
+            weighted_path = _ica_fig_path(
+                bids_basename_for_figs,
+                ica_out_dir,
+                "ica+ecg",
+                "icaWeightedMaps",
+                ".tsv",
+            )
+            ecg_weighted_df.to_csv(weighted_path, sep="\t", index_label="sensor")
 
         # --- EOG scores ---
         if len(eog_scores) > 0:
@@ -442,10 +478,37 @@ def find_ica_artifacts(
             fig.savefig(fig_path, dpi=150, bbox_inches="tight")
             plt.close(fig)
 
-            npy_path = _ica_fig_path(
-                bids_basename_for_figs, ica_out_dir, "ica+eog", "icaScores", ".npy"
+            # Save EOG scores as TSV [n_IC, 1]
+            # If multi-channel EOG, pick the channel with max abs correlation
+            if eog_scores.ndim > 1:
+                best_ch = np.argmax(np.abs(eog_scores), axis=0)
+                eog_scores_1d = eog_scores[
+                    best_ch, np.arange(eog_scores.shape[1])
+                ]
+            else:
+                eog_scores_1d = eog_scores
+            eog_scores_df = pd.DataFrame(
+                {"score": eog_scores_1d}, index=ic_labels
             )
-            np.save(npy_path, eog_scores)
+            eog_scores_df.index.name = "component"
+            tsv_path = _ica_fig_path(
+                bids_basename_for_figs, ica_out_dir, "ica+eog", "icaScores", ".tsv"
+            )
+            eog_scores_df.to_csv(tsv_path, sep="\t")
+
+            # Save score-weighted z-scored sensor maps [n_channels, n_IC]
+            eog_weighted = ic_maps_z * eog_scores_1d[np.newaxis, :]
+            eog_weighted_df = pd.DataFrame(
+                eog_weighted, columns=ic_labels, index=ica.ch_names
+            )
+            weighted_path = _ica_fig_path(
+                bids_basename_for_figs,
+                ica_out_dir,
+                "ica+eog",
+                "icaWeightedMaps",
+                ".tsv",
+            )
+            eog_weighted_df.to_csv(weighted_path, sep="\t", index_label="sensor")
 
         # --- ECG sources ---
         if ecg_evoked is not None:
