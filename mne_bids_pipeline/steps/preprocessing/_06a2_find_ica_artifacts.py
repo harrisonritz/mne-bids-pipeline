@@ -480,11 +480,14 @@ def find_ica_artifacts(
 
             # Save EOG scores as TSV [n_IC, 1]
             # If multi-channel EOG, pick the channel with max abs correlation
+            # find_bads_eog returns a list of arrays (one per channel) when
+            # ch_name is a list; convert to ndarray so .ndim works correctly.
+            eog_scores = np.array(eog_scores)
             if eog_scores.ndim > 1:
-                best_ch = np.argmax(np.abs(eog_scores), axis=0)
-                eog_scores_1d = eog_scores[
-                    best_ch, np.arange(eog_scores.shape[1])
-                ]
+                best_ch = np.argmax(np.abs(eog_scores), axis=0, keepdims=True)
+                eog_scores_1d = np.take_along_axis(
+                    eog_scores, best_ch, axis=0
+                ).ravel()
             else:
                 eog_scores_1d = eog_scores
             eog_scores_df = pd.DataFrame(
