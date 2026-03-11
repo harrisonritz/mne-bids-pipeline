@@ -203,13 +203,12 @@ def apply_ica_epochs(
         )
         return ica_out_dir / bp.basename
 
-    raw_fnames = [in_files.pop(f"raw_run-{run}") for run in cfg.runs]
-    bids_basename = raw_fnames[0].copy().update(processing=None, split=None, run=None)
-    ica_out_dir = out_files["ica"].fpath.parent / "ICA"
+    bids_basename = out_files['epochs'].copy().update(processing=None, split=None, run=None)
+    ica_out_dir = bids_basename.copy().update(processing="ica", suffix="ica").fpath.parent / "ICA"
     ica_out_dir.mkdir(exist_ok=True, parents=True)
     bids_basename_for_figs = bids_basename.copy()
     del bids_basename
-    
+
     figs = ica.plot_components(colorbar=True, show=False)
     if not isinstance(figs, list):
         figs = [figs]
@@ -220,6 +219,15 @@ def apply_ica_epochs(
         )
         fig.savefig(fig_path, dpi=150, bbox_inches="tight")
         plt.close(fig)
+
+
+    # --- ICA overlay (original vs cleaned signal) ---
+    fig = ica.plot_overlay(inst=epochs.average(), show=False, on_baseline="reapply")
+    fig_path = _ica_fig_path(
+        bids_basename_for_figs, ica_out_dir, "ica", "icaOverlay"
+    )
+    fig.savefig(fig_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
 
     return _prep_out_files(exec_params=exec_params, out_files=out_files)
 
