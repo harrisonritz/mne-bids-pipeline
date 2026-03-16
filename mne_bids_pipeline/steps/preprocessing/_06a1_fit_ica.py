@@ -27,7 +27,6 @@ from mne_bids_pipeline._import_data import annotations_to_events, make_epochs
 from mne_bids_pipeline._logging import gen_log_kwargs, logger
 from mne_bids_pipeline._parallel import get_parallel_backend, parallel_func
 from mne_bids_pipeline._reject import _get_reject
-from mne_bids_pipeline._report import _open_report
 from mne_bids_pipeline._run import (
     _prep_out_files,
     _update_for_splits,
@@ -35,6 +34,8 @@ from mne_bids_pipeline._run import (
     save_logs,
 )
 from mne_bids_pipeline.typing import InFilesT, OutFilesT
+
+# from mne_bids_pipeline._report import _open_report
 
 N_JOBS=-1
 
@@ -318,47 +319,49 @@ def run_ica(
     ica.save(out_files["ica"], overwrite=True)
 
     # Add to report
-    tags = ("ica", "epochs")
-    title = "ICA: epochs for fitting"
-    with _open_report(
-        cfg=cfg,
-        exec_params=exec_params,
-        subject=subject,
-        session=session,
-        task=cfg.task,
-    ) as report:
-        report.add_epochs(
-            epochs=epochs,
-            title=title,
-            drop_log_ignore=(),
-            replace=True,
-            tags=tags,
-        )
-        if cfg.ica_reject == "autoreject_local":
-            assert ar_reject_log is not None
-            caption = (
-                f"Autoreject was run to produce cleaner epochs before fitting ICA. "
-                f"{ar_reject_log.bad_epochs.sum()} epochs were rejected because more "
-                f"than {ar_n_interpolate_} channels were bad (cross-validated "
-                f"n_interpolate limit; excluding globally bad and non-data channels, "
-                f"shown in white). Note that none of the blue segments were actually "
-                f"interpolated before submitting the data to ICA. This is following "
-                f"the recommended approach for ICA described in the the Autoreject "
-                f"documentation."
-            )
-            fig = ar_reject_log.plot(
-                orientation="horizontal", aspect="auto", show=False
-            )
-            report.add_figure(
-                fig=fig,
-                title="Autoreject cleaning",
-                section=title,
-                caption=caption,
-                tags=tags + ("autoreject",),
-                replace=True,
-            )
-            plt.close(fig)
-            del caption
+    # msg = "Adding ICA epochs to report."
+    # logger.info(**gen_log_kwargs(message=msg))
+    # tags = ("ica", "epochs")
+    # title = "ICA: epochs for fitting"
+    # with _open_report(
+    #     cfg=cfg,
+    #     exec_params=exec_params,
+    #     subject=subject,
+    #     session=session,
+    #     task=cfg.task,
+    # ) as report:
+    #     report.add_epochs(
+    #         epochs=epochs,
+    #         title=title,
+    #         drop_log_ignore=(),
+    #         replace=True,
+    #         tags=tags,
+    #     )
+    #     if cfg.ica_reject == "autoreject_local":
+    #         assert ar_reject_log is not None
+    #         caption = (
+    #             f"Autoreject was run to produce cleaner epochs before fitting ICA. "
+    #             f"{ar_reject_log.bad_epochs.sum()} epochs were rejected because more "
+    #             f"than {ar_n_interpolate_} channels were bad (cross-validated "
+    #             f"n_interpolate limit; excluding globally bad and non-data channels, "
+    #             f"shown in white). Note that none of the blue segments were actually "
+    #             f"interpolated before submitting the data to ICA. This is following "
+    #             f"the recommended approach for ICA described in the the Autoreject "
+    #             f"documentation."
+    #         )
+    #         fig = ar_reject_log.plot(
+    #             orientation="horizontal", aspect="auto", show=False
+    #         )
+    #         report.add_figure(
+    #             fig=fig,
+    #             title="Autoreject cleaning",
+    #             section=title,
+    #             caption=caption,
+    #             tags=tags + ("autoreject",),
+    #             replace=True,
+    #         )
+    #         plt.close(fig)
+    #         del caption
     return _prep_out_files(exec_params=exec_params, out_files=out_files)
 
 
