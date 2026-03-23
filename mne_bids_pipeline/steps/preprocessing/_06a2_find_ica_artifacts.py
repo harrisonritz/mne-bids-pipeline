@@ -7,7 +7,9 @@ To actually remove designated ICA components from your data, you will have to
 run the apply_ica step.
 """
 
+import os
 import pathlib
+import shutil
 from types import SimpleNamespace
 from typing import Literal
 
@@ -37,6 +39,115 @@ from mne_bids_pipeline._run import (
 from mne_bids_pipeline.typing import FloatArrayT, InFilesT, OutFilesT
 
 N_JOBS=-1
+
+# ---------------------------------------------------------------------------
+# Per-component timeout (seconds) for plot_properties + savefig.
+# Set to 0 or None to disable.
+# ---------------------------------------------------------------------------
+_ICA_PROPERTY_TIMEOUT: int | None = 120
+
+
+def _get_ica_scratch_dir(ica_out_dir: pathlib.Path) -> pathlib.Path | None:
+    """Return a node-local scratch directory for ICA figure I/O.
+
+    Checks (in order): ICA_FIG_SCRATCH, SLURM_TMPDIR, TMPDIR, /tmp.
+    Returns None only if ICA_FIG_SCRATCH is explicitly set to "0" or "off".
+    """
+    # Allow explicit opt-out
+    explicit = os.environ.get("ICA_FIG_SCRATCH", "")
+    if explicit.lower() in ("0", "off", "false", "no"):
+        return None
+
+    candidates = [
+        os.environ.get("ICA_FIG_SCRATCH"),
+        os.environ.get("SLURM_TMPDIR"),
+        os.environ.get("TMPDIR"),
+        "/tmp",
+    ]
+    for candidate in candidates:
+        if candidate is not None:
+            p = pathlib.Path(candidate)
+            if p.is_dir() and os.access(p, os.W_OK):
+                scratch = p / f"ica_figs_{os.getpid()}"
+                scratch.mkdir(parents=True, exist_ok=True)
+                return scratch
+    return None
+
+
+def _sync_ica_scratch_to_gpfs(
+    scratch_dir: pathlib.Path,
+    gpfs_dir: pathlib.Path,
+) -> None:
+    """Copy all files from *scratch_dir* to *gpfs_dir*, then clean up."""
+    gpfs_dir.mkdir(parents=True, exist_ok=True)
+    for src in scratch_dir.iterdir():
+        if src.is_file():
+            dst = gpfs_dir / src.name
+            # Atomic-ish: write to tmp, then rename
+            dst_tmp = dst.with_suffix(dst.suffix + f".tmp.{os.getpid()}")
+            try:
+                shutil.copy2(src, dst_tmp)
+                os.replace(dst_tmp, dst)
+            except BaseException:
+                dst_tmp.unlink(missing_ok=True)
+                raise
+    # Clean up scratch
+    shutil.rmtree(scratch_dir, ignore_errors=True)
+
+
+def _plot_property_with_timeout(
+    ica,
+    epochs,
+    pick: int,
+    bids_basename_for_figs,
+    ica_out_dir: pathlib.Path,
+    timeout: int | None,
+):
+    """Plot a single IC's properties and save to disk, with optional timeout.
+
+    Uses signal.alarm (SIGALRM) for the timeout since this runs in the
+    main process and avoids multiprocessing overhead.
+    """
+    import signal
+    import matplotlib.pyplot as plt
+
+    timed_out = False
+
+    def _alarm_handler(signum, frame):
+        raise TimeoutError(f"IC {pick:03d} plot_properties timed out after {timeout}s")
+
+    # Set alarm if timeout is enabled and we're on a POSIX system
+    old_handler = None
+    if timeout and hasattr(signal, "SIGALRM"):
+        old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
+        signal.alarm(timeout)
+
+    try:
+        figs_props = ica.plot_properties(inst=epochs, picks=pick, show=False)
+        if not isinstance(figs_props, list):
+            figs_props = [figs_props]
+        for fig in figs_props:
+            suffix = f"icaProperties{pick:03d}"
+            fig_path = _ica_fig_path(
+                bids_basename_for_figs, ica_out_dir, "ica", suffix
+            )
+            fig.savefig(fig_path, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+    except TimeoutError:
+        timed_out = True
+        logger.warning(
+            **gen_log_kwargs(
+                message=f"⏱ IC {pick:03d}: timed out after {timeout}s, skipping."
+            )
+        )
+    finally:
+        # Cancel alarm and restore handler
+        if timeout and hasattr(signal, "SIGALRM"):
+            signal.alarm(0)
+            if old_handler is not None:
+                signal.signal(signal.SIGALRM, old_handler)
+
+    return not timed_out
 
 
 def _ica_fig_path(
@@ -380,6 +491,19 @@ def find_ica_artifacts(
 
     # Export ICA figures as PNGs and scores as NPY arrays
     logger.info(**gen_log_kwargs(message="Saving ICA figures to PNG files."))
+
+    # Option 2: Use node-local scratch to avoid GPFS I/O stalls
+    scratch_dir = _get_ica_scratch_dir(ica_out_dir)
+    if scratch_dir is not None:
+        fig_out_dir = scratch_dir
+        logger.info(
+            **gen_log_kwargs(
+                message=f"Using local scratch for ICA figures: {scratch_dir}"
+            )
+        )
+    else:
+        fig_out_dir = ica_out_dir
+
     with _agg_backend():
         import matplotlib.pyplot as plt
 
@@ -390,32 +514,41 @@ def find_ica_artifacts(
         for fi, fig in enumerate(figs):
             suffix = "icaComponents" if fi == 0 else f"icaComponents{fi + 1}"
             fig_path = _ica_fig_path(
-                bids_basename_for_figs, ica_out_dir, "ica", suffix
+                bids_basename_for_figs, fig_out_dir, "ica", suffix
             )
             fig.savefig(fig_path, dpi=150, bbox_inches="tight")
             plt.close(fig)
 
-        # --- Component properties ---
+        # --- Component properties (with per-component timeout) ---
         if cfg.ica_plot_component_properties == "all":
             props_picks = list(range(ica.n_components_))
         else:  # "excluded"
             props_picks = list(ica.exclude)
 
+        n_ok, n_timeout = 0, 0
         for pick in props_picks:
-            figs_props = ica.plot_properties(inst=epochs, picks=pick, show=False)
-            if not isinstance(figs_props, list):
-                figs_props = [figs_props]
-            for fig in figs_props:
-                suffix = f"icaProperties{pick:03d}"
-                fig_path = _ica_fig_path(
-                    bids_basename_for_figs, ica_out_dir, "ica", suffix
-                )
-                fig.savefig(fig_path, dpi=150, bbox_inches="tight")
-                plt.close(fig)
+            ok = _plot_property_with_timeout(
+                ica=ica,
+                epochs=epochs,
+                pick=pick,
+                bids_basename_for_figs=bids_basename_for_figs,
+                ica_out_dir=fig_out_dir,
+                timeout=_ICA_PROPERTY_TIMEOUT,
+            )
+            if ok:
+                n_ok += 1
+            else:
+                n_timeout += 1
+
+        msg = (
+            f"Component properties: {n_ok}/{len(props_picks)} saved"
+            + (f" ({n_timeout} timed out)" if n_timeout else "")
+        )
+        logger.info(**gen_log_kwargs(message=msg))
 
         # save sensor names for matching to scores
         sensor_names_path = _ica_fig_path(
-            bids_basename_for_figs, ica_out_dir, "ica", "sensorNames", ".tsv"
+            bids_basename_for_figs, fig_out_dir, "ica", "sensorNames", ".tsv"
         )
         pd.DataFrame({"sensor": ica.ch_names}).to_csv(sensor_names_path, sep="\t", index=False)
 
@@ -426,7 +559,7 @@ def find_ica_artifacts(
             ic_maps, columns=ic_labels, index=ica.ch_names
         )
         ic_maps_path = _ica_fig_path(
-            bids_basename_for_figs, ica_out_dir, "ica", "icaSensorMaps", ".tsv"
+            bids_basename_for_figs, fig_out_dir, "ica", "icaSensorMaps", ".tsv"
         )
         ic_maps_df.to_csv(ic_maps_path, sep="\t", index_label="sensor")
 
@@ -439,7 +572,7 @@ def find_ica_artifacts(
         if len(ecg_scores) > 0:
             fig = ica.plot_scores(scores=ecg_scores, labels="ecg", show=False)
             fig_path = _ica_fig_path(
-                bids_basename_for_figs, ica_out_dir, "ica+ecg", "icaScores"
+                bids_basename_for_figs, fig_out_dir, "ica+ecg", "icaScores"
             )
             fig.savefig(fig_path, dpi=150, bbox_inches="tight")
             plt.close(fig)
@@ -451,7 +584,7 @@ def find_ica_artifacts(
             )
             ecg_scores_df.index.name = "component"
             tsv_path = _ica_fig_path(
-                bids_basename_for_figs, ica_out_dir, "ica+ecg", "icaScores", ".tsv"
+                bids_basename_for_figs, fig_out_dir, "ica+ecg", "icaScores", ".tsv"
             )
             ecg_scores_df.to_csv(tsv_path, sep="\t")
 
@@ -462,7 +595,7 @@ def find_ica_artifacts(
             )
             weighted_path = _ica_fig_path(
                 bids_basename_for_figs,
-                ica_out_dir,
+                fig_out_dir,
                 "ica+ecg",
                 "icaWeightedMaps",
                 ".tsv",
@@ -473,7 +606,7 @@ def find_ica_artifacts(
         if len(eog_scores) > 0:
             fig = ica.plot_scores(scores=eog_scores, labels="eog", show=False)
             fig_path = _ica_fig_path(
-                bids_basename_for_figs, ica_out_dir, "ica+eog", "icaScores"
+                bids_basename_for_figs, fig_out_dir, "ica+eog", "icaScores"
             )
             fig.savefig(fig_path, dpi=150, bbox_inches="tight")
             plt.close(fig)
@@ -495,7 +628,7 @@ def find_ica_artifacts(
             )
             eog_scores_df.index.name = "component"
             tsv_path = _ica_fig_path(
-                bids_basename_for_figs, ica_out_dir, "ica+eog", "icaScores", ".tsv"
+                bids_basename_for_figs, fig_out_dir, "ica+eog", "icaScores", ".tsv"
             )
             eog_scores_df.to_csv(tsv_path, sep="\t")
 
@@ -506,7 +639,7 @@ def find_ica_artifacts(
             )
             weighted_path = _ica_fig_path(
                 bids_basename_for_figs,
-                ica_out_dir,
+                fig_out_dir,
                 "ica+eog",
                 "icaWeightedMaps",
                 ".tsv",
@@ -517,7 +650,7 @@ def find_ica_artifacts(
         if ecg_evoked is not None:
             fig = ica.plot_sources(inst=ecg_evoked, show=False)
             fig_path = _ica_fig_path(
-                bids_basename_for_figs, ica_out_dir, "ica+ecg", "icaSources"
+                bids_basename_for_figs, fig_out_dir, "ica+ecg", "icaSources"
             )
             fig.savefig(fig_path, dpi=150, bbox_inches="tight")
             plt.close(fig)
@@ -526,7 +659,7 @@ def find_ica_artifacts(
         if eog_evoked is not None:
             fig = ica.plot_sources(inst=eog_evoked, show=False)
             fig_path = _ica_fig_path(
-                bids_basename_for_figs, ica_out_dir, "ica+eog", "icaSources"
+                bids_basename_for_figs, fig_out_dir, "ica+eog", "icaSources"
             )
             fig.savefig(fig_path, dpi=150, bbox_inches="tight")
             plt.close(fig)
@@ -534,10 +667,18 @@ def find_ica_artifacts(
         # --- ICA overlay (original vs cleaned signal) ---
         fig = ica.plot_overlay(inst=epochs.average(), show=False, on_baseline="reapply")
         fig_path = _ica_fig_path(
-            bids_basename_for_figs, ica_out_dir, "ica", "icaOverlay"
+            bids_basename_for_figs, fig_out_dir, "ica", "icaOverlay"
         )
         fig.savefig(fig_path, dpi=150, bbox_inches="tight")
         plt.close(fig)
+
+    # Sync local scratch files to GPFS (single batch copy)
+    if scratch_dir is not None:
+        logger.info(
+            **gen_log_kwargs(message="Syncing ICA figures from local scratch to GPFS.")
+        )
+        _sync_ica_scratch_to_gpfs(scratch_dir, ica_out_dir)
+        logger.info(**gen_log_kwargs(message="ICA figure sync complete."))
 
     msg = 'Carefully review the extracted ICs and mark components "bad" in:'
     logger.info(**gen_log_kwargs(message=msg, emoji="🛑"))
