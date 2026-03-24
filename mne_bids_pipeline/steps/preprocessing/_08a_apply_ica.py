@@ -261,24 +261,24 @@ def apply_ica_raw(
     raw.save(out_files[in_key], overwrite=True, split_size=cfg._raw_split_size)
     _update_for_splits(out_files, in_key)
     # Report
-    with _open_report(
-        cfg=cfg,
-        exec_params=exec_params,
-        subject=subject,
-        session=session,
-        run=run,
-        task=task,
-    ) as report:
-        msg = "Adding cleaned raw data to report"
-        logger.info(**gen_log_kwargs(message=msg))
-        _add_raw(
-            cfg=cfg,
-            report=report,
-            bids_path_in=out_files[in_key],
-            title="Raw (clean)",
-            tags=("clean",),
-            raw=raw,
-        )
+    # with _open_report(
+    #     cfg=cfg,
+    #     exec_params=exec_params,
+    #     subject=subject,
+    #     session=session,
+    #     run=run,
+    #     task=task,
+    # ) as report:
+    #     msg = "Adding cleaned raw data to report"
+    #     logger.info(**gen_log_kwargs(message=msg))
+    #     _add_raw(
+    #         cfg=cfg,
+    #         report=report,
+    #         bids_path_in=out_files[in_key],
+    #         title="Raw (clean)",
+    #         tags=("clean",),
+    #         raw=raw,
+    #     )
     return _prep_out_files(exec_params=exec_params, out_files=out_files)
 
 
