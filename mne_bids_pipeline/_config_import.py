@@ -115,8 +115,10 @@ def _import_config(
         # Misc
         "deriv_root",
         "config_path",
+        # Reports
+        "generate_reports",
     ) + extra_exec_params_keys
-    in_both = {"deriv_root"}
+    in_both = {"deriv_root", "generate_reports"}
     exec_params = SimpleNamespace(**{k: getattr(config, k) for k in keys})
     override_keys = ("subjects",)
     exec_params.overrides = SimpleNamespace(

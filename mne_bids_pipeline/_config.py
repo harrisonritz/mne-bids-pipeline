@@ -2536,6 +2536,24 @@ If `None`, it defaults to the current default in MNE-Python.
     ```
 """
 
+generate_reports: bool = True
+"""
+Whether to generate HTML/HDF5 reports for each processing step.
+
+Set to ``False`` to disable all report generation. This is useful in HPC
+environments where parallel file locking on network filesystems can cause
+race conditions, even with file-lock-based serialisation.
+
+When disabled, no ``.h5`` or ``.html`` report files are written. All other
+pipeline outputs (epochs, evokeds, source estimates, etc.) are unaffected.
+
+???+ example "Example"
+    Disable report generation:
+    ```python
+    generate_reports = False
+    ```
+"""
+
 # %%
 # # Caching
 #

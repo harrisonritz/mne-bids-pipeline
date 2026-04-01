@@ -28,6 +28,18 @@ from ._logging import _linkfile, gen_log_kwargs, logger
 from .typing import FloatArrayT
 
 
+class _NullReport:
+    """No-op drop-in for ``mne.Report`` used when ``generate_reports=False``.
+
+    Every attribute access returns a callable that silently discards its
+    arguments, so all ``report.add_*(...)`` and ``report.remove(...)`` calls
+    in step code are absorbed without error and without any file I/O.
+    """
+
+    def __getattr__(self, name: str):
+        return lambda *args, **kwargs: None
+
+
 @contextlib.contextmanager
 def _open_report(
     *,
@@ -40,6 +52,9 @@ def _open_report(
     fname_report: BIDSPath | None = None,
     name: str = "report",
 ) -> Generator[mne.Report, None, None]:
+    if not exec_params.generate_reports:
+        yield _NullReport()  # type: ignore[misc]
+        return
     if fname_report is None:
         fname_report = BIDSPath(
             subject=subject,
