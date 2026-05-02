@@ -1984,6 +1984,25 @@ that is different from `fsaverage`.
     ```
 """
 
+use_precomputed_trans: bool = False
+"""
+Whether to load a precomputed head↔MRI transformation from the FreeSurfer
+subjects directory instead of computing it from BIDS anatomical landmarks.
+
+When `True`, the pipeline reads the trans file directly from:
+`{fs_subjects_dir}/{fs_subject}/bem/{fs_subject}-trans.fif`
+
+This is useful when coregistration was performed outside the BIDS pipeline
+(e.g., via manual coregistration in MNE or a custom tool) and the resulting
+trans file has been saved to the FreeSurfer `bem/` folder. It avoids the need
+to embed anatomical landmarks in the BIDS T1w JSON sidecar.
+
+???+ example "Example"
+    ```python
+    use_precomputed_trans = True
+    ```
+"""
+
 bem_mri_images: Literal["FLASH", "T1", "auto"] = "auto"
 """
 Which types of MRI images to use when creating the BEM model.
