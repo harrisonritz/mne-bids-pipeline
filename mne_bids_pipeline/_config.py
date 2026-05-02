@@ -136,6 +136,48 @@ proc: str | None = None
 The BIDS `processing` entity.
 """
 
+custom_proc: str | None = None
+"""
+Read raw input data from `deriv_root` instead of `bids_root`. Use this when
+running custom preprocessing steps before MNE-BIDS-Pipeline.
+
+When set to a non-empty alphanumeric string (e.g. `"init"`), the pipeline's
+first read of "raw" data is redirected to:
+
+```
+<deriv_root>/sub-X/[ses-Y]/<datatype>/sub-X_..._proc-<custom_proc>_raw.fif
+```
+
+The recommended workflow is:
+
+1. Run `mne_bids_pipeline --steps=init` to create `deriv_root`.
+2. Run your custom preprocessing externally, writing FIFs into `deriv_root`
+   following the BIDS-derivatives naming convention with `processing=<custom_proc>`,
+   `suffix="raw"`, `extension=".fif"`.
+3. Run `mne_bids_pipeline --steps=preprocessing` (or another stage). The
+   pipeline will read the custom-preprocessed FIFs from `deriv_root` rather
+   than reading raw data from `bids_root`.
+
+Because `deriv_root` is not a complete BIDS dataset, the pipeline will load
+the FIFs directly with `mne.io.read_raw_fif` rather than `mne_bids.read_raw_bids`.
+This means bad-channel marks (`raw.info["bads"]`), channel types, and event
+annotations (`raw.annotations`) **must already be baked into the FIF**. The
+typical way to achieve this is to load the original data with
+`mne_bids.read_raw_bids`, apply your custom preprocessing, and save with
+`raw.save()` — that round-trip preserves all the relevant metadata.
+
+`bids_root` is still required (it is used for subject/session discovery,
+sidecar-based event counts in the report, FreeSurfer / forward-model paths,
+and as the fall-back location for empty-room data).
+
+Mutually exclusive with `proc`: setting both raises a `ConfigError`.
+
+???+ example "Example"
+    ```python
+    custom_proc = "init"  # read sub-01_..._proc-init_raw.fif from deriv_root
+    ```
+"""
+
 rec: str | None = None
 """
 The BIDS `recording` entity.

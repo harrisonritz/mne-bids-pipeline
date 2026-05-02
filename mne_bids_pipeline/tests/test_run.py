@@ -284,6 +284,147 @@ allow_missing_sessions = {allow_missing_sessions}
             main()
 
 
+def test_custom_proc(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Test reading raw input from `deriv_root` via `custom_proc`.
+
+    Builds a tiny real EEG BIDS dataset, runs the pipeline `init` step to
+    create the derivatives folder, then writes a custom-preprocessed FIF into
+    `deriv_root` with `proc-init` naming. Finally, runs frequency filtering
+    with `custom_proc='init'` and verifies that the filtered output is
+    derived from the deriv_root file (not from `bids_root`).
+    """
+    import mne
+    import numpy as np
+    from mne_bids import BIDSPath as _BIDSPath
+    from mne_bids import write_raw_bids
+
+    bids_root = tmp_path / "bids"
+    deriv_root = tmp_path / "derivatives" / "mne-bids-pipeline"
+
+    # Build a tiny synthetic EEG raw with a couple of events.
+    sfreq = 200.0
+    n_chans = 4
+    n_samples = int(sfreq * 4)  # 4 s
+    rng = np.random.default_rng(0)
+    data = rng.standard_normal((n_chans, n_samples)) * 1e-6
+    ch_names = [f"EEG{i:03d}" for i in range(n_chans)]
+    info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types="eeg")
+    raw = mne.io.RawArray(data, info)
+    raw.set_montage(
+        mne.channels.make_standard_montage("standard_1020"),
+        match_case=False,
+        on_missing="ignore",
+    )
+    # Two dummy events of two conditions.
+    onsets = np.array([0.5, 2.5])
+    raw.set_annotations(
+        mne.Annotations(
+            onset=onsets, duration=[0.0, 0.0], description=["cond_a", "cond_b"]
+        )
+    )
+
+    bp = _BIDSPath(
+        subject="01",
+        task="foo",
+        datatype="eeg",
+        root=bids_root,
+        suffix="eeg",
+        extension=".vhdr",
+    )
+    import warnings as _warnings
+
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("ignore")
+        write_raw_bids(
+            raw,
+            bp,
+            events=None,
+            format="BrainVision",
+            allow_preload=True,
+            overwrite=True,
+            verbose=False,
+        )
+
+    # Write the pipeline config.
+    config_text = f"""
+bids_root = "{bids_root}"
+deriv_root = "{deriv_root}"
+interactive = False
+subjects = ["01"]
+task = "foo"
+ch_types = ["eeg"]
+conditions = ["cond_a", "cond_b"]
+custom_proc = "init"
+process_empty_room = False
+process_rest = False
+l_freq = None
+h_freq = 40
+"""
+    config_path = tmp_path / "custom_proc_config.py"
+    config_path.write_text(config_text)
+
+    # Step 1: run init to create the derivatives folder.
+    monkeypatch.setenv("_MNE_BIDS_STUDY_TESTING", "true")
+    monkeypatch.setattr(
+        sys, "argv", ["mne_bids_pipeline", str(config_path), "--steps=init"]
+    )
+    with capsys.disabled():
+        print()
+        main()
+    assert (deriv_root / "dataset_description.json").exists()
+
+    # Step 2: emulate the user's external custom preprocessing by writing
+    # a *_proc-init_raw.fif into deriv_root. We just save the original raw
+    # we built above (it already has annotations baked in).
+    custom_path = (
+        deriv_root
+        / "sub-01"
+        / "eeg"
+        / "sub-01_task-foo_proc-init_raw.fif"
+    )
+    raw.save(custom_path, overwrite=True)
+    assert custom_path.exists()
+
+    # Step 3: run frequency filtering. With custom_proc='init', the pipeline
+    # must read from deriv_root (not bids_root). Run only the steps needed
+    # to exercise the redirection: data quality + frequency filtering.
+    # _01_data_quality is the first step that reads "orig" data, and it
+    # also writes a bads.tsv that _04 needs.
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "mne_bids_pipeline",
+            str(config_path),
+            "--steps=preprocessing/_01_data_quality,preprocessing/_04_frequency_filter",
+        ],
+    )
+    with capsys.disabled():
+        print()
+        main()
+
+    # Verify that the filtered output exists.
+    filt_path = (
+        deriv_root
+        / "sub-01"
+        / "eeg"
+        / "sub-01_task-foo_proc-filt_raw.fif"
+    )
+    assert filt_path.exists(), (
+        f"Expected filtered output {filt_path} but it does not exist. "
+        "Pipeline did not read from custom-preprocessed deriv_root file."
+    )
+    # Sanity: the filtered file should be smaller than 1 s of raw data
+    # (we only have 4 s of data).
+    raw_filt = mne.io.read_raw_fif(filt_path)
+    assert raw_filt.info["sfreq"] == sfreq
+    assert raw_filt.n_times == n_samples
+
+
 @pytest.mark.dataset_test
 def test_session_specific_mri(
     monkeypatch: pytest.MonkeyPatch,
