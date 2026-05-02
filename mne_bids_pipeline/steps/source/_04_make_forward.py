@@ -66,21 +66,6 @@ def _prepare_trans_template(
     return trans
 
 
-def _prepare_trans_precomputed(
-    *,
-    cfg: SimpleNamespace,
-) -> mne.transforms.Transform:
-    trans_path = cfg.fs_subjects_dir / cfg.fs_subject / "bem" / f"{cfg.fs_subject}-trans.fif"
-    if not trans_path.exists():
-        raise FileNotFoundError(
-            f"Precomputed trans not found: {trans_path}. "
-            "Run manual coregistration and save the trans file to that location."
-        )
-    msg = f"Loading precomputed trans from {trans_path}"
-    logger.info(**gen_log_kwargs(message=msg))
-    return mne.read_trans(trans_path)
-
-
 def _prepare_trans_subject(
     *,
     cfg: SimpleNamespace,
@@ -145,8 +130,6 @@ def get_input_fnames_forward(
     _, tag = _get_bem_conductivity(cfg)
     in_files["bem"] = bem_path / f"{cfg.fs_subject}-{tag}-bem-sol.fif"
     in_files["src"] = bem_path / f"{cfg.fs_subject}-{cfg.spacing}-src.fif"
-    if cfg.use_precomputed_trans:
-        in_files["precomputed_trans"] = bem_path / f"{cfg.fs_subject}-trans.fif"
     return in_files
 
 
@@ -197,10 +180,7 @@ def run_forward(
     src = in_files.pop("src")
 
     # trans
-    if cfg.use_precomputed_trans:
-        in_files.pop("precomputed_trans", None)
-        trans = _prepare_trans_precomputed(cfg=cfg)
-    elif cfg.use_template_mri is not None:
+    if cfg.use_template_mri is not None:
         trans = _prepare_trans_template(
             cfg=cfg,
             subject=subject,
@@ -293,7 +273,6 @@ def get_config(
         spacing=config.spacing,
         use_template_mri=config.use_template_mri,
         adjust_coreg=config.adjust_coreg,
-        use_precomputed_trans=config.use_precomputed_trans,
         source_info_path_update=config.source_info_path_update,
         noise_cov=_sanitize_callable(config.noise_cov),
         ch_types=config.ch_types,
