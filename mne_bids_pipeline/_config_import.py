@@ -278,6 +278,23 @@ def _check_config(config: SimpleNamespace, config_path: PathLike | None) -> None
 
     config.bids_root.resolve(strict=True)
 
+    if config.custom_proc is not None:
+        if config.proc is not None:
+            raise ConfigError(
+                "`proc` and `custom_proc` are mutually exclusive: `proc` selects "
+                "files in `bids_root`, while `custom_proc` selects custom-preprocessed "
+                "files in `deriv_root`. Got "
+                f"proc={config.proc!r}, custom_proc={config.custom_proc!r}."
+            )
+        if not isinstance(config.custom_proc, str) or not re.fullmatch(
+            r"[a-zA-Z0-9]+", config.custom_proc
+        ):
+            raise ConfigError(
+                "`custom_proc` must be a non-empty alphanumeric string (BIDS entity "
+                "values cannot contain underscores or hyphens). Got "
+                f"custom_proc={config.custom_proc!r}."
+            )
+
     if (
         config.use_maxwell_filter
         and len(set(config.ch_types).intersection(("meg", "grad", "mag"))) == 0
