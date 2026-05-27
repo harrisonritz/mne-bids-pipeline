@@ -87,10 +87,36 @@ section_tags = {
     "logging": ("logging", "error-handling"),
     "error handling": ("error-handling",),
 }
+section_titles = {
+    "general settings": "General settings",
+    "break detection": "Break detection",
+    "bad channel detection": "Bad channel detection",
+    "maxwell filter": "Maxwell filtering",
+    "filtering & resampling": "Filtering & resampling",
+    "filtering": "Filtering",
+    "resampling": "Resampling",
+    "epoching": "Epoching",
+    "stimulation artifact": "Stimulation artifact",
+    "ssp, ica,": "SSP, ICA, and artifact regression",
+    "amplitude-based artifact": "Amplitude-based artifact rejection",
+    "condition contrasts": "Condition contrasts",
+    "decoding /": "Decoding / MVPA",
+    "time-frequency analysis": "Time-frequency analysis",
+    "group-level analysis": "Group-level analysis",
+    "general source": "General settings",
+    "bem surface": "BEM surface",
+    "source space": "Source space & forward solution",
+    "inverse solution": "Inverse solution",
+    "report generation": "Report generation",
+    "caching": "Caching",
+    "parallelization": "Parallelization",
+    "logging": "Logging",
+    "error handling": "Error handling",
+}
 
 extra_headers = {
-    "general settings": """\
-!!! info
+    "general settings": """
+???+ Info
     Many settings in this section control the pipeline behavior very early in the
     pipeline. Therefore, for most of them (e.g., `bids_root`) we do not list the
     steps that directly depend on the setting. The options with drop-down step
@@ -111,12 +137,14 @@ assign_re = re.compile(
     "^"  #         The line starts, then is followed by
     r"(\w+): "  #  annotation syntax (name captured by the first group),
     "(?:"  #       then the rest of the line can be (in a non-capturing group):
-    ".+ = .+"  #     1. a standard assignment
-    "|"  #           2. or
-    r"Literal\["  #  3. the start of a multiline type annotation like "a: Literal["
-    "|"  #           4. or
-    r"\("  #         5. the start of a multiline 3.9+ type annotation like "a: ("
-    ")"  #         Then the end of our group
+    ".+ = .+"  #      1. a standard assignment
+    "|"  #            2. or
+    r"Literal\["  #   3. the start of a multiline type annotation like "a: Literal["
+    "|"  #            4. or
+    r"Annotated\["  # 5. the start of a multiline annotated type like "a: Annotated["
+    "|"  #            6. or
+    r"\("  #          7. the start of a multiline 3.9+ type annotation like "a: ("
+    ")"  #        Then the end of our group
     "$",  #       and immediately the end of the line.
     re.MULTILINE,
 )
@@ -175,6 +203,10 @@ def main() -> None:
                 current_lines += ["---", "tags:"]
                 current_lines += [f"  - {tag}" for tag in section_tags[key]]
                 current_lines += ["---"]
+            if key in section_titles:
+                if current_lines:
+                    current_lines += [""]
+                current_lines += [f"# {section_titles[key]}", ""]
             if key in extra_headers:
                 current_lines.extend(["", extra_headers[key]])
             continue

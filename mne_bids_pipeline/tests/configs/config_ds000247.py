@@ -1,10 +1,17 @@
-"""OMEGA Resting State Sample Data."""
+"""ds000247: OMEGA Resting State.
+
+See [OpenNeuro](https://openneuro.org/datasets/ds000247) for more information.
+"""
 
 import numpy as np
 
 bids_root = "~/mne_data/ds000247"
 deriv_root = "~/mne_data/derivatives/mne-bids-pipeline/ds000247"
 
+ignore_warnings = [
+    'No BIDS -> MNE mapping found for channel type "SYSCLOCK"',
+    r"Unable to map the following column\(s\)",  # dominant_hand
+]
 subjects = ["0002"]
 sessions = ["01"]
 task = "rest"

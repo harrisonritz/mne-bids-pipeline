@@ -13,6 +13,8 @@ from ._logging import gen_log_kwargs, logger
 from ._parallel import get_parallel_backend
 from ._run import _short_step_path
 
+_LOGGING_OPTIONS = ("info", "warning", "error")
+
 
 def main() -> None:
     from . import __version__
@@ -48,7 +50,7 @@ def main() -> None:
         'source', 'report',  or 'all',  or the name of a processing group plus
         the desired step sans the step number and
         filename extension, separated by a '/'. For example, to run ICA, you
-        would pass 'sensor/run_ica`. If unspecified, will run all processing
+        would pass 'preprocessing/ica`. If unspecified, will run all processing
         steps. Can also be a tuple of steps."""
         ),
     )
@@ -105,6 +107,17 @@ def main() -> None:
         dest="no_cache",
         action="store_true",
         help="Disable caching of intermediate results.",
+    )
+    parser.add_argument(
+        "--logger-level",
+        dest="logger_level",
+        default=None,
+        help=(
+            f"Set the logger level ({', '.join(_LOGGING_OPTIONS)}). "
+            "Default will use the value in the configuration file.",
+        ),
+        metavar="LEVEL",
+        choices=_LOGGING_OPTIONS,
     )
     options = parser.parse_args()
 
@@ -183,6 +196,8 @@ def main() -> None:
         overrides.on_error = on_error
     if not cache:
         overrides.memory_location = False
+    if options.logger_level:
+        overrides.logger_level = options.logger_level
 
     step_modules: list[ModuleType] = []
     STEP_MODULES = _get_step_modules()

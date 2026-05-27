@@ -32,13 +32,16 @@ def _download_via_openneuro(*, ds_name: str, ds_path: Path) -> None:
     options = DATASET_OPTIONS[ds_name]
     assert "hash" not in options
 
-    openneuro.download(
+    kwargs = dict(
         dataset=options["openneuro"],
         target_dir=ds_path,
         include=options.get("include", []),
         exclude=options.get("exclude", []),
-        verify_size=False,
+        tag=options.get("tag", None),
+        max_concurrent_downloads=1,  # avoid hitting timeout errors
     )
+    print(f"Downloading with openneuro.download(**{kwargs})")
+    openneuro.download(**kwargs)
 
 
 def _download_from_web(*, ds_name: str, ds_path: Path) -> None:

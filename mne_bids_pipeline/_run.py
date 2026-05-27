@@ -1,5 +1,6 @@
 """Script-running utilities."""
 
+import contextlib
 import copy
 import functools
 import hashlib
@@ -9,6 +10,7 @@ import pdb
 import sys
 import time
 import traceback
+import warnings
 from collections.abc import Callable, Iterable
 from types import SimpleNamespace
 from typing import Any, Literal
@@ -19,9 +21,8 @@ from filelock import FileLock
 from joblib import Memory
 from mne_bids import BIDSPath
 
-from ._config_utils import get_task
 from ._logging import _is_testing, gen_log_kwargs, logger
-from .typing import InFilesT, OutFilesT
+from .typing import InFilesPathT, InFilesT, OutFilesT
 
 
 def failsafe_run(
@@ -29,10 +30,13 @@ def failsafe_run(
     get_input_fnames: Callable[..., Any] | None = None,
     get_output_fnames: Callable[..., Any] | None = None,
     require_output: bool = True,
+    sidecars: bool = False,
 ) -> Callable[..., Any]:
     def failsafe_run_decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         @functools.wraps(func)  # Preserve "identity" of original function
-        def __mne_bids_pipeline_failsafe_wrapper__(*args, **kwargs):  # type: ignore
+        def __mne_bids_pipeline_failsafe_wrapper__(
+            *args: list[Any], **kwargs: dict[str, Any]
+        ) -> pd.Series | None:
             __mne_bids_pipeline_step__ = pathlib.Path(inspect.getfile(func))  # noqa
             exec_params = kwargs["exec_params"]
             on_error = exec_params.on_error
@@ -42,21 +46,17 @@ def failsafe_run(
                 get_output_fnames=get_output_fnames,
                 require_output=require_output,
                 func_name=f"{__mne_bids_pipeline_step__}::{func.__name__}",
+                sidecars=sidecars,
             )
             t0 = time.time()
-            log_info = pd.concat(
-                [
-                    pd.Series(kwargs, dtype=object),
-                    pd.Series(index=["time", "success", "error_message"], dtype=object),
-                ]
-            )
 
+            success = True
+            error_message = ""
+            did_run = True
             try:
                 assert len(args) == 0, args  # make sure params are only kwargs
-                out = memory.cache(func)(*args, **kwargs)
-                assert out is None  # nothing should be returned
-                log_info["success"] = True
-                log_info["error_message"] = ""
+                did_run = memory.cache(func)(*args, **kwargs)
+                assert isinstance(did_run, bool)  # whether or not it ran
             except Exception as e:
                 # Only keep what gen_log_kwargs() can handle
                 kwargs_log = {
@@ -64,9 +64,10 @@ def failsafe_run(
                     for k in ("subject", "session", "task", "run")
                     if k in kwargs
                 }
-                message = f"A critical error occurred. The error message was: {str(e)}"
-                log_info["success"] = False
-                log_info["error_message"] = str(e)
+                e_str = "\n".join(traceback.format_exception_only(e)).strip()
+                message = f"A critical error occurred. The error message was: {e_str}"
+                success = False
+                error_message = e_str
 
                 # Find the limit / step where the error occurred
                 step_dir = pathlib.Path(__file__).parent / "steps"
@@ -79,7 +80,7 @@ def failsafe_run(
                         # generally be stuff from this file and joblib
                         tb_list = tb_list[fi:]
                         break
-                tb = "".join(traceback.format_list(tb_list))
+                tb = "".join(traceback.format_list(tb_list) + [e_str])
 
                 if on_error == "abort":
                     message += f"\n\nAborting pipeline run. The traceback is:\n\n{tb}"
@@ -104,7 +105,17 @@ def failsafe_run(
                     logger.error(
                         **gen_log_kwargs(message=message, **kwargs_log, emoji="🔂")
                     )
+            if not did_run:
+                return None  # no log info to return
+            log_info = pd.concat(
+                [
+                    pd.Series(kwargs, dtype=object),
+                    pd.Series(index=["time", "success", "error_message"], dtype=object),
+                ]
+            )
             log_info["time"] = round(time.time() - t0, ndigits=1)
+            log_info["success"] = success
+            log_info["error_message"] = error_message
             return log_info
 
         return __mne_bids_pipeline_failsafe_wrapper__
@@ -128,6 +139,7 @@ class ConditionalStepMemory:
         get_output_fnames: Callable[..., Any] | None,
         require_output: bool,
         func_name: str,
+        sidecars: bool = False,
     ) -> None:
         memory_location = exec_params.memory_location
         if memory_location is True:
@@ -146,11 +158,15 @@ class ConditionalStepMemory:
         self.get_input_fnames = get_input_fnames
         self.get_output_fnames = get_output_fnames
         self.memory_file_method = exec_params.memory_file_method
+        self.ignore_warnings = exec_params.ignore_warnings
         self.require_output = require_output
         self.func_name = func_name
+        self.sidecars = sidecars
 
     def cache(self, func: Callable[..., Any]) -> Callable[..., Any]:
-        def wrapper(*args: list[Any], **kwargs: dict[str, Any]) -> None:
+        def __mbp_cached_func_wrapper__(
+            *args: list[Any], **kwargs: dict[str, Any]
+        ) -> bool:
             in_files = out_files = None
             force_run = kwargs.pop("force_run", False)
             these_kwargs = kwargs.copy()
@@ -162,7 +178,7 @@ class ConditionalStepMemory:
             del these_kwargs
             if self.memory is None:
                 func(*args, **kwargs)
-                return
+                return True
 
             # This is an implementation detail so we don't need a proper error
             assert isinstance(in_files, dict), type(in_files)
@@ -176,9 +192,8 @@ class ConditionalStepMemory:
             hashes = []
             for k, v in in_files.items():
                 hashes.append(hash_(k, v))
-                # also hash the sidecar files if this is a BIDSPath and
-                # MNE-BIDS is new enough
-                if not hasattr(v, "find_matching_sidecar"):
+                # also hash the sidecar files if this is a BIDSPath
+                if not (self.sidecars and isinstance(v, BIDSPath)):
                     continue
                 # from mne_bids/read.py
                 # The v.datatype is maybe not right, might need to use
@@ -190,8 +205,8 @@ class ConditionalStepMemory:
                     ("coordsystem", ".json"),
                     (v.datatype, ".json"),
                 ):
-                    sidecar = v.find_matching_sidecar(
-                        suffix=suffix, extension=extension, on_error="ignore"
+                    sidecar = _find_matching_sidecar_cached(
+                        v, suffix=suffix, extension=extension
                     )
                     if sidecar is None:
                         continue
@@ -199,6 +214,18 @@ class ConditionalStepMemory:
 
             kwargs["cfg"] = copy.deepcopy(kwargs["cfg"])
             assert isinstance(kwargs["cfg"], SimpleNamespace), type(kwargs["cfg"])
+            # make sure we don't pass in a bare/complete `config`.
+            # We should *always* limit it to what is needed for a given step, otherwise
+            # unnecessary cache hits will occur, including those when command-line
+            # arguments are changed (e.g., `--pdb`). If it's not limited, it will have
+            # some entries like this, which we inject ourselves during config import:
+            NON_SPECIFIC_CONFIG_KEY = "PIPELINE_NAME"
+            if func.__name__ != "init_dataset":
+                assert NON_SPECIFIC_CONFIG_KEY not in kwargs["cfg"].__dict__, (
+                    "\nInternal error: cfg should be limited to step-specific entries "
+                    f"only for:\n\n{self.func_name}\n\nPlease report this to "
+                    "MNE-BIDS-Pipeline developers."
+                )
             kwargs["cfg"].hashes = hashes
             del in_files  # will be modified by func call
 
@@ -215,10 +242,13 @@ class ConditionalStepMemory:
             run = kwargs.get("run", None)  # noqa
             task = kwargs.get("task", None)  # noqa
             bad_out_files = False
+            logger_call = logger.info
             try:
                 done = memorized_func.check_call_in_cache(*args, **kwargs)
-            except Exception:
+            except Exception as exc:
                 done = False
+                msg = f"Computation forced because of caching error: {exc}"
+                emoji = "🤷"
             if done:
                 if unknown_inputs:
                     msg = (
@@ -231,28 +261,25 @@ class ConditionalStepMemory:
                     emoji = "🔂"
                 else:
                     # Check our output file hashes
-                    # Need to make a copy of kwargs["in_files"] in particular
-                    use_kwargs = copy.deepcopy(kwargs)
-                    out_files_hashes = memorized_func(*args, **use_kwargs)
+                    out_files_hashes = memorized_func(*args, **kwargs)
                     for key, (fname, this_hash) in out_files_hashes.items():
                         fname = pathlib.Path(fname)
                         if not fname.exists():
-                            msg = f"Output file missing: {fname}, will recompute …"
-                            emoji = "🧩"
+                            msg = f"Output file missing, will recompute: {fname}"
+                            emoji = "✖️"
                             bad_out_files = True
                             break
                         got_hash = hash_(key, fname, kind="out")[1]
                         if this_hash != got_hash:
                             msg = (
-                                f"Output file {self.memory_file_method} mismatch for "
-                                f"{fname} ({this_hash} != {got_hash}), will "
-                                "recompute …"
+                                f"Output file {self.memory_file_method} mismatch "
+                                f"({this_hash} != {got_hash}), will recompute: {fname}"
                             )
                             emoji = "🚫"
                             bad_out_files = True
                             break
                     else:
-                        msg = "Computation unnecessary (cached) …"
+                        msg = f"Computation unnecessary (cached {func.__name__}(…)) …"
                         emoji = "cache"
             # When out_files_expected is not None, we should check if the output files
             # exist and stop if they do (e.g., in bem surface or coreg surface
@@ -269,24 +296,36 @@ class ConditionalStepMemory:
                     msg = "Computation unnecessary (output files exist) …"
                     emoji = "🔍"
                     short_circuit = True
+            else:
+                # Ensure memorized_func.check_call_in_cache returned False
+                # as opposed to raised an error (which already sets `msg` above)
+                if msg is None:
+                    logger_call = logger.debug
+
+                    msg = "Cached result not found, computing …"
+                    emoji = "🆕"
             del out_files
 
-            if msg is not None:
-                assert emoji is not None
-                logger.info(**gen_log_kwargs(message=msg, emoji=emoji))
+            assert msg is not None
+            assert emoji is not None
+            logger_call(**gen_log_kwargs(message=msg, emoji=emoji))
+            del logger_call
             if short_circuit:
-                return
+                return False  # did not run
 
             # https://joblib.readthedocs.io/en/latest/memory.html#joblib.memory.MemorizedFunc.call  # noqa: E501
             if force_run or unknown_inputs or bad_out_files:
                 # Joblib 1.4.0 only returns the output, but 1.3.2 returns both.
                 # Fortunately we can use tuple-ness to tell the difference (we always
                 # return None or a dict)
-                out_files = memorized_func.call(*args, **kwargs)
+                done = False
+                with _ignore_warnings(self.ignore_warnings):
+                    out_files = memorized_func.call(*args, **kwargs)
                 if isinstance(out_files, tuple):
                     out_files = out_files[0]
             else:
-                out_files = memorized_func(*args, **kwargs)
+                with _ignore_warnings(self.ignore_warnings):
+                    out_files = memorized_func(*args, **kwargs)
             if self.require_output:
                 assert isinstance(out_files, dict) and len(out_files), (
                     f"Internal error: step must return non-empty out_files dict, got "
@@ -297,21 +336,36 @@ class ConditionalStepMemory:
                     f"Internal error: step must return None, got {type(out_files)} "
                     f"for:\n{self.func_name}"
                 )
+            return not done
 
-        return wrapper
+        return __mbp_cached_func_wrapper__
 
     def clear(self) -> None:
         self.memory.clear()
 
 
-def save_logs(*, config: SimpleNamespace, logs: Iterable[pd.Series]) -> None:
-    fname = config.deriv_root / f"task-{get_task(config)}_log.xlsx"
+@contextlib.contextmanager
+def _ignore_warnings(ignore_warnings: Iterable[str] | str) -> Iterable[None]:
+    if isinstance(ignore_warnings, str):
+        ignore_warnings = [ignore_warnings]
+    with warnings.catch_warnings():
+        for msg in ignore_warnings:
+            warnings.filterwarnings("ignore", message=rf"[\S\s]*{msg}[\S\s]*")
+        yield
+
+
+def save_logs(*, config: SimpleNamespace, logs: Iterable[pd.Series | None]) -> None:
+    usable_logs = [log for log in logs if log is not None]
+    if not usable_logs:
+        return
+    all_tasks = "+".join(map(str, config.all_tasks))
+    fname = config.deriv_root / f"task-{all_tasks}_log.xlsx"
 
     # Get the script from which the function is called for logging
     sheet_name = _short_step_path(_get_step_path()).replace("/", "-")
     sheet_name = sheet_name[-30:]  # shorten due to limit of excel format
 
-    df = pd.DataFrame(logs)
+    df = pd.DataFrame(usable_logs)
     del logs
 
     with FileLock(fname.with_suffix(fname.suffix + ".lock")):
@@ -423,18 +477,32 @@ def _prep_out_files(
     exec_params: SimpleNamespace,
     out_files: InFilesT,
     check_relative: pathlib.Path | None = None,
-    bids_only: bool = True,
+) -> OutFilesT:
+    for key, fname in out_files.items():
+        assert isinstance(fname, BIDSPath), (
+            f'out_files["{key}"] must be a BIDSPath, got {type(fname)}'
+        )
+        if fname.suffix not in ("raw", "epo"):
+            assert fname.split is None, fname
+    return _prep_out_files_path(
+        exec_params=exec_params,
+        out_files=out_files,
+        check_relative=check_relative,
+    )
+
+
+def _prep_out_files_path(
+    *,
+    exec_params: SimpleNamespace,
+    out_files: InFilesPathT,
+    check_relative: pathlib.Path | None = None,
 ) -> OutFilesT:
     if check_relative is None:
         check_relative = exec_params.deriv_root
     for key, fname in out_files.items():
         # Sanity check that we only ever write to the derivatives directory
-        if bids_only:
-            assert isinstance(fname, BIDSPath), (type(fname), fname)
         # raw and epochs can split on write, and .save should check for us now, so
         # we only need to check *other* types (these should never split)
-        if isinstance(fname, BIDSPath) and fname.suffix not in ("raw", "epo"):
-            assert fname.split is None, fname
         fname = pathlib.Path(fname)
         if not fname.is_relative_to(check_relative):
             raise RuntimeError(
@@ -448,6 +516,34 @@ def _prep_out_files(
             kind="out",
         )
     return out_files
+
+
+def _find_matching_sidecar_cached(
+    bids_path: BIDSPath, suffix: str | None, extension: str
+) -> pathlib.Path | None:
+    state = bids_path.entities
+    for key in ("root", "suffix", "extension", "datatype", "check"):
+        val = getattr(bids_path, key)
+        state[key] = val
+    return _find_matching_sidecar_cached_impl(
+        **state, pass_suffix=suffix, pass_extension=extension
+    )
+
+
+@functools.cache
+def _find_matching_sidecar_cached_impl(
+    *, pass_suffix: str | None, pass_extension: str, **state: dict[str, Any]
+) -> pathlib.Path | None:
+    # We have to do this dance because BIDSPath objects are not hashable, but we
+    # want to cache the sidecar finding (which can be expensive when there are
+    # many files in a directory). So we cache based on the BIDSPath's state, which
+    # is hashable (as it's just a dict of strings and bools).
+    bids_path = BIDSPath(**state)
+    return bids_path.find_matching_sidecar(
+        suffix=pass_suffix,
+        extension=pass_extension,
+        on_error="ignore",
+    )
 
 
 def _path_to_str_hash(

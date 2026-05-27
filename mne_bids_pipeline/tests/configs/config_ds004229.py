@@ -1,6 +1,7 @@
-"""Single-subject infant dataset for testing maxwell_filter with movecomp.
+"""ds004229: infant MEG data.
 
-https://openneuro.org/datasets/ds004229
+Single-subject infant dataset for testing maxwell_filter with movecomp.
+See [OpenNeuro](https://openneuro.org/datasets/ds004229) for more information.
 """
 
 import mne
@@ -11,6 +12,9 @@ deriv_root = "~/mne_data/derivatives/mne-bids-pipeline/ds004229"
 
 task = "amnoise"
 crop_runs = (300.0, 600.0)  # 5 minutes from the middle of the recording for speed
+ignore_warnings = [
+    "Head position change is over 25 mm",  # head moves a lot for this dataset
+]
 
 find_flat_channels_meg = True
 find_noisy_channels_meg = True
@@ -51,6 +55,7 @@ h_freq = 40.0
 
 # SSP and peak-to-peak rejection
 spatial_filter = "ssp"
+process_raw_clean = False
 n_proj_eog = dict(n_mag=0, n_grad=0)
 n_proj_ecg = dict(n_mag=2, n_grad=2)
 ssp_ecg_channel = "MEG0113"  # ECG channel is not hooked up in this dataset

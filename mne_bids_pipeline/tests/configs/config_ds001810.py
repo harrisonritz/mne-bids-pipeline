@@ -1,4 +1,7 @@
-"""tDCS EEG."""
+"""ds001810: tDCS EEG.
+
+See [OpenNeuro](https://openneuro.org/datasets/ds001810) for more information.
+"""
 
 import numpy as np
 import pandas as pd
@@ -16,6 +19,7 @@ conditions = ["61450", "61511"]
 contrasts = [("61450", "61511"), ("letter=='a'", "letter=='b'")]
 decode = True
 decoding_n_splits = 3  # only for testing, use 5 otherwise
+decoding_time_decim = 3  # for speed
 
 l_freq = 0.3
 

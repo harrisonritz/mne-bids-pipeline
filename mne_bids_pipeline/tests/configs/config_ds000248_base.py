@@ -1,4 +1,7 @@
-"""MNE Sample Data: M/EEG combined processing."""
+"""ds000248: MNE sample data (M/EEG).
+
+See [OpenNeuro](https://openneuro.org/datasets/ds000248) for more information.
+"""
 
 import mne
 import mne_bids
@@ -25,7 +28,6 @@ use_maxwell_filter = True
 def noise_cov(bp: mne_bids.BIDSPath) -> mne.Covariance:
     """Estimate the noise covariance."""
     # Use pre-stimulus period as noise source
-    bp = bp.copy().update(suffix="epo")
     if not bp.fpath.exists():
         bp.update(split="01")
     epo = mne.read_epochs(bp)
@@ -34,6 +36,7 @@ def noise_cov(bp: mne_bids.BIDSPath) -> mne.Covariance:
 
 
 spatial_filter = "ssp"
+process_raw_clean = False
 n_proj_eog = dict(n_mag=1, n_grad=1, n_eeg=1)
 n_proj_ecg = dict(n_mag=1, n_grad=1, n_eeg=0)
 ssp_meg = "combined"
