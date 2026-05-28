@@ -265,6 +265,7 @@ class _ParseConfigSteps:
                         if key not in (
                             "_bids_kwargs",
                             "_import_data_kwargs",
+                            "get_runs",
                             "_get_runs_sst",
                             "get_datatype",
                             "get_runs_tasks",

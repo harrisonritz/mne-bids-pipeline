@@ -6,7 +6,8 @@ different machine) the component order might differ.
 """
 
 from types import SimpleNamespace
-
+import matplotlib.pyplot as plt
+import pathlib
 import mne
 import pandas as pd
 from mne.preprocessing import read_ica
@@ -165,32 +166,72 @@ def apply_ica_epochs(
     assert len(in_files) == 0, in_files.keys()
 
     # Report
-    kwargs = dict()
-    if ica.exclude:
-        msg = "Adding ICA to report."
-    else:
-        msg = "Skipping ICA addition to report, no components marked as bad."
-        kwargs["emoji"] = "skip"
-    logger.info(**gen_log_kwargs(message=msg, **kwargs))
-    if ica.exclude:
-        with _open_report(
-            cfg=cfg,
-            exec_params=exec_params,
-            subject=subject,
-            session=session,
-        ) as report:
-            report.add_ica(
-                ica=ica,
-                title="ICA: removals",
-                inst=epochs,
-                picks=ica.exclude,
-                # TODO upstream
-                # captions=f'Evoked response (across all epochs) '
-                # f'before and after ICA '
-                # f'({len(ica.exclude)} ICs removed)'
-                replace=True,
-                n_jobs=1,  # avoid automatic parallelization
-            )
+    # kwargs = dict()
+    # if ica.exclude:
+    #     msg = "Adding ICA to report."
+    # else:
+    #     msg = "Skipping ICA addition to report, no components marked as bad."
+    #     kwargs["emoji"] = "skip"
+    # logger.info(**gen_log_kwargs(message=msg, **kwargs))
+    # if ica.exclude:
+    #     with _open_report(
+    #         cfg=cfg,
+    #         exec_params=exec_params,
+    #         subject=subject,
+    #         session=session,
+    #     ) as report:
+    #         report.add_ica(
+    #             ica=ica,
+    #             title="ICA: removals",
+    #             inst=epochs,
+    #             picks=ica.exclude,
+    #             # TODO upstream
+    #             # captions=f'Evoked response (across all epochs) '
+    #             # f'before and after ICA '
+    #             # f'({len(ica.exclude)} ICs removed)'
+    #             replace=True,
+    #             n_jobs=1,  # avoid automatic parallelization
+    #         )
+
+    # --- Component topographies ---
+    def _ica_fig_path(
+        bids_basename: BIDSPath,
+        ica_out_dir: pathlib.Path,
+        processing: str,
+        suffix: str,
+        extension: str = ".png",
+    ) -> pathlib.Path:
+        """Build a BIDS-style filename in the ICA output directory."""
+        bp = bids_basename.copy().update(
+            processing=processing, suffix=suffix, extension=extension
+        )
+        return ica_out_dir / bp.basename
+
+    bids_basename = out_files['epochs'].copy().update(processing=None, split=None, run=None)
+    ica_out_dir = bids_basename.copy().update(processing="ica", suffix="ica").fpath.parent / "ICA"
+    ica_out_dir.mkdir(exist_ok=True, parents=True)
+    bids_basename_for_figs = bids_basename.copy()
+    del bids_basename
+
+    figs = ica.plot_components(colorbar=True, show=False)
+    if not isinstance(figs, list):
+        figs = [figs]
+    for fi, fig in enumerate(figs):
+        suffix = "icaComponents" if fi == 0 else f"icaComponents{fi + 1}"
+        fig_path = _ica_fig_path(
+            bids_basename_for_figs, ica_out_dir, "ica", suffix
+        )
+        fig.savefig(fig_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
+
+    # --- ICA overlay (original vs cleaned signal) ---
+    fig = ica.plot_overlay(inst=epochs.average(), show=False, on_baseline="reapply")
+    fig_path = _ica_fig_path(
+        bids_basename_for_figs, ica_out_dir, "ica", "icaOverlay"
+    )
+    fig.savefig(fig_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
 
     return _prep_out_files(exec_params=exec_params, out_files=out_files)
 

@@ -1,4 +1,5 @@
 import argparse
+import logging
 import pathlib
 import time
 from textwrap import dedent
@@ -13,7 +14,12 @@ from ._logging import gen_log_kwargs, logger
 from ._parallel import get_parallel_backend
 from ._run import _short_step_path
 
-_LOGGING_OPTIONS = ("info", "warning", "error")
+_LOGGING_OPTIONS = {
+    "debug": logging.DEBUG,
+    "info": logging.INFO,
+    "warning": logging.WARNING,
+    "error": logging.ERROR,
+}
 
 
 def main() -> None:
@@ -117,7 +123,7 @@ def main() -> None:
             "Default will use the value in the configuration file.",
         ),
         metavar="LEVEL",
-        choices=_LOGGING_OPTIONS,
+        choices=tuple(_LOGGING_OPTIONS),
     )
     options = parser.parse_args()
 
@@ -197,7 +203,7 @@ def main() -> None:
     if not cache:
         overrides.memory_location = False
     if options.logger_level:
-        overrides.logger_level = options.logger_level
+        overrides.log_level = options.logger_level
 
     step_modules: list[ModuleType] = []
     STEP_MODULES = _get_step_modules()

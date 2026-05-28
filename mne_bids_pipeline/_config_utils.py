@@ -501,7 +501,6 @@ def _get_ssrt(
         )
     ]
 
-
 def _limit_which_clean(*, config: SimpleNamespace) -> tuple[str, ...]:
     which: tuple[str, ...] = ()
     if config.process_raw_clean:
@@ -861,7 +860,6 @@ def _validate_contrasts(
     else:
         contrasts_dict = contrasts
     del contrasts
-    # Now it's always a dict
     bad_keys = set(contrasts_dict) - set(tasks_list)
     if bad_keys:
         raise ValueError(

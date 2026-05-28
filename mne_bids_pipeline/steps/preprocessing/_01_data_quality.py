@@ -212,7 +212,7 @@ def assess_data_quality(
         task=task,
     ) as report:
         # Original data
-        kind = "original" if not cfg.proc else cfg.proc
+        kind = getattr(cfg, "custom_proc", None) or cfg.proc or "original"
         msg = f"Adding {kind} raw data to report"
         logger.info(**gen_log_kwargs(message=msg))
         prefix, extra_tags = _get_prefix_tags(cfg=cfg, task=task, run=run)
@@ -223,6 +223,7 @@ def assess_data_quality(
         )
         text_kwargs = dict(
             title=f"Bad channels{prefix}",
+
             section="Data quality",
             tags=tags,
             replace=True,

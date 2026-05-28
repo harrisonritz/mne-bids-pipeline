@@ -107,6 +107,25 @@ def test_validation(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     bad_text += "on_error = 'debug' if debug else 'raise'\n"
     config_path.write_text(bad_text)
     _import_config(config_path=config_path)  # this is okay
+
+    # custom_proc must not be combined with proc
+    bad_text = working_text + "proc = 'sss'\ncustom_proc = 'init'\n"
+    config_path.write_text(bad_text)
+    with pytest.raises(ConfigError, match=r"`proc` and `custom_proc` are mutually"):
+        _import_config(config_path=config_path)
+    # custom_proc must be a non-empty alphanumeric string
+    bad_text = working_text + "custom_proc = ''\n"
+    config_path.write_text(bad_text)
+    with pytest.raises(ConfigError, match=r"`custom_proc` must be a non-empty"):
+        _import_config(config_path=config_path)
+    bad_text = working_text + "custom_proc = 'has-hyphen'\n"
+    config_path.write_text(bad_text)
+    with pytest.raises(ConfigError, match=r"`custom_proc` must be a non-empty"):
+        _import_config(config_path=config_path)
+    # a well-formed custom_proc on its own is fine
+    bad_text = working_text + "custom_proc = 'init'\n"
+    config_path.write_text(bad_text)
+    _import_config(config_path=config_path)
     # matching deriv and bids
     bad_text = working_text
     bad_text += f"deriv_root = '{tmp_path}'"

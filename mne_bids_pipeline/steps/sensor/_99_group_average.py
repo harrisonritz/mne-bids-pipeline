@@ -1101,11 +1101,17 @@ def _run_decoding(*, config: SimpleNamespace, task: str | None) -> None:
         config=config,
         task=task,
     )
+
     sessions = get_sessions(config=config)
     if cfg.decode or cfg.decoding_csp:
         decoding_contrasts = _get_task_decoding_contrasts(config=cfg, task=task)
     else:
         decoding_contrasts = []
+    sc = [
+        (session, contrast)
+        for session in sessions
+        for contrast in decoding_contrasts
+    ]
     logs = list()
     with get_parallel_backend(exec_params):
         # 1. Evoked data
@@ -1150,11 +1156,6 @@ def _run_decoding(*, config: SimpleNamespace, task: str | None) -> None:
             ]
             # Time-by-time
             if cfg.decoding_time:
-                sc = [
-                    (session, contrast)
-                    for session in sessions
-                    for contrast in decoding_contrasts
-                ]
                 parallel, run_func = parallel_func(
                     average_time_by_time_decoding,
                     exec_params=exec_params,
@@ -1172,6 +1173,7 @@ def _run_decoding(*, config: SimpleNamespace, task: str | None) -> None:
                     )
                     for session, contrast in sc
                 )
+
 
         # 3. CSP
         if cfg.decoding_csp and decoding_contrasts:

@@ -140,6 +140,48 @@ proc: str | None = None
 The BIDS `processing` entity.
 """
 
+custom_proc: str | None = None
+"""
+Read raw input data from `deriv_root` instead of `bids_root`. Use this when
+running custom preprocessing steps before MNE-BIDS-Pipeline.
+
+When set to a non-empty alphanumeric string (e.g. `"init"`), the pipeline's
+first read of "raw" data is redirected to:
+
+```
+<deriv_root>/sub-X/[ses-Y]/<datatype>/sub-X_..._proc-<custom_proc>_raw.fif
+```
+
+The recommended workflow is:
+
+1. Run `mne_bids_pipeline --steps=init` to create `deriv_root`.
+2. Run your custom preprocessing externally, writing FIFs into `deriv_root`
+   following the BIDS-derivatives naming convention with `processing=<custom_proc>`,
+   `suffix="raw"`, `extension=".fif"`.
+3. Run `mne_bids_pipeline --steps=preprocessing` (or another stage). The
+   pipeline will read the custom-preprocessed FIFs from `deriv_root` rather
+   than reading raw data from `bids_root`.
+
+Because `deriv_root` is not a complete BIDS dataset, the pipeline will load
+the FIFs directly with `mne.io.read_raw_fif` rather than `mne_bids.read_raw_bids`.
+This means bad-channel marks (`raw.info["bads"]`), channel types, and event
+annotations (`raw.annotations`) **must already be baked into the FIF**. The
+typical way to achieve this is to load the original data with
+`mne_bids.read_raw_bids`, apply your custom preprocessing, and save with
+`raw.save()` — that round-trip preserves all the relevant metadata.
+
+`bids_root` is still required (it is used for subject/session discovery,
+sidecar-based event counts in the report, FreeSurfer / forward-model paths,
+and as the fall-back location for empty-room data).
+
+Mutually exclusive with `proc`: setting both raises a `ConfigError`.
+
+???+ example "Example"
+    ```python
+    custom_proc = "init"  # read sub-01_..._proc-init_raw.fif from deriv_root
+    ```
+"""
+
 rec: str | None = None
 """
 The BIDS `recording` entity.
@@ -1568,6 +1610,15 @@ that more ICs will be identified as EOG-related. If too low, the
 false-alarm rate increases dramatically.
 """
 
+ica_plot_component_properties: Literal["all", "excluded"] = "excluded"
+"""
+Controls which ICA components have their properties plotted as individual
+PNG files during artifact detection.
+
+- ``"all"``: Plot properties for every component.
+- ``"excluded"``: Only plot properties for components marked for exclusion.
+"""
+
 ica_use_icalabel: bool = False
 """
 Whether to use MNE-ICALabel to automatically label ICA components. Only available for
@@ -1868,6 +1919,43 @@ decoding_n_splits: Annotated[int, Ge(2)] = 5
 """
 The number of folds (also called "splits") to use in the K-fold cross-validation
 scheme.
+"""
+
+
+decoding_LOGO: bool = False
+"""
+do leave-one-group-out (LOGO) cross-validation, where the "groups" are defined by the
+metadata column specified in `decoding_LOGO_group`. This is a more conservative approach
+to cross-validation, as it ensures that the model is tested on data from a group that
+was not seen during training. This can help to prevent overfitting and provide a more
+realistic estimate of the model's performance on unseen data.
+"""
+
+decoding_LOGO_group: str | None = None
+"""
+The name of the metadata column to use for defining the groups in LOGO cross-validation.
+This parameter is only relevant if `decoding_LOGO` is set to `True`. The values in this
+column will be used to define the groups for LOGO cross-validation. Each unique value
+in this column will be treated as a separate group, and the model will be trained on
+all groups except one, which will be used for testing. This process will be repeated
+until each group has been used as the test set once.
+"""
+
+decoding_baseline: tuple[float, float] | None = None
+"""
+Whether to perform baseline decoding. This means that the decoding will be performed
+on the baseline period of the epochs, which is typically a time window before the
+event onset. This can be useful to check if there are any differences between conditions
+before the event of interest, which could indicate confounding factors or biases in the
+data.
+"""
+
+decoding_equalize: bool = True
+"""
+Whether to equalize the number of epochs in each condition before decoding. This is
+done by randomly selecting a subset of epochs from the condition with more epochs, so
+that both conditions have the same number of epochs. This can help to prevent bias in
+the decoding results due to imbalanced class sizes.
 """
 
 decoding_time: bool = True
@@ -2535,6 +2623,24 @@ If `None`, it defaults to the current default in MNE-Python.
         "grad": {"vmin": 0, "vmax": 1e13 * reject["grad"]},  # fT/cm
         "mag": {"vmin": 0, "vmax": 1e15 * reject["mag"]},  # fT
     }
+    ```
+"""
+
+generate_reports: bool = True
+"""
+Whether to generate HTML/HDF5 reports for each processing step.
+
+Set to ``False`` to disable all report generation. This is useful in HPC
+environments where parallel file locking on network filesystems can cause
+race conditions, even with file-lock-based serialisation.
+
+When disabled, no ``.h5`` or ``.html`` report files are written. All other
+pipeline outputs (epochs, evokeds, source estimates, etc.) are unaffected.
+
+???+ example "Example"
+    Disable report generation:
+    ```python
+    generate_reports = False
     ```
 """
 

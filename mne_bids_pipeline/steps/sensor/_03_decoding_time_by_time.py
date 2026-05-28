@@ -25,7 +25,7 @@ from mne.decoding import (
 )
 from mne_bids import BIDSPath
 from scipy.io import loadmat, savemat
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import LeaveOneGroupOut, StratifiedKFold
 from sklearn.pipeline import make_pipeline
 
 from mne_bids_pipeline._config_utils import (
@@ -53,6 +53,8 @@ from mne_bids_pipeline._run import (
     save_logs,
 )
 from mne_bids_pipeline.typing import InFilesT, OutFilesT
+
+N_JOBS = -1
 
 
 def get_input_fnames_time_decoding(
@@ -132,16 +134,29 @@ def run_time_decoding(
     # We have to use this approach because the conditions could be based on
     # metadata selection, so simply using epochs[conds[0], conds[1]] would
     # not work.
-    epochs = mne.concatenate_epochs(
-        [epochs[epochs_conds[0]], epochs[epochs_conds[1]]],
-        verbose="error",
-    )
+    if cfg.decoding_equalize:
+        epochs1 = epochs[epochs_conds[0]]
+        epochs2 = epochs[epochs_conds[1]]
+        mne.epochs.equalize_epoch_counts([epochs1, epochs2])
+
+        epochs = mne.concatenate_epochs([epochs1, epochs2], verbose="error")
+        del epochs1, epochs2
+    else:
+        epochs = mne.concatenate_epochs(
+            [epochs[epochs_conds[0]], epochs[epochs_conds[1]]], verbose="error"
+        )
     n_cond1 = len(epochs[epochs_conds[0]])
     n_cond2 = len(epochs[epochs_conds[1]])
     pick_idx = mne.pick_types(
         epochs.info, meg=True, eeg=True, ref_meg=False, exclude="bads"
     )
     epochs.pick(pick_idx)
+    print("channels: ", epochs.ch_names)
+    # apply baseline
+    if cfg.decoding_baseline is not None:
+        print(f"Applying baseline correction for decoding: {cfg.decoding_baseline}")
+        epochs.apply_baseline(cfg.decoding_baseline)
+
     # We can't use the full rank here because the number of samples can just be the
     # number of epochs (which can be fewer than the number of channels)
     pre_steps = _decoding_preproc_steps(
@@ -171,17 +186,16 @@ def run_time_decoding(
     # ProgressBar does not work on dask, so only enable it if not using dask
     verbose = get_parallel_backend_name(exec_params=exec_params) != "dask"
     with get_parallel_backend(exec_params):
+        # clf = make_pipeline(
+        #     *pre_steps,
+        #     Vectorizer(),
+        #     LogReg(random_state=cfg.random_state),
+        # )
         clf = make_pipeline(
             *pre_steps,
             Vectorizer(),
             LogReg(random_state=cfg.random_state),
         )
-        cv = StratifiedKFold(
-            shuffle=True,
-            random_state=cfg.random_state,
-            n_splits=cfg.decoding_n_splits,
-        )
-
         if cfg.decoding_time_generalization:
             estimator = GeneralizingEstimator(
                 clf,
@@ -193,18 +207,35 @@ def run_time_decoding(
             estimator = SlidingEstimator(
                 clf,
                 scoring=cfg.decoding_metric,
-                n_jobs=1,
+                n_jobs=N_JOBS,
             )
             cv_scoring_n_jobs = exec_params.n_jobs
 
-        scores = cross_val_multiscore(
-            estimator,
-            X=X,
-            y=y,
-            cv=cv,
-            n_jobs=cv_scoring_n_jobs,
-            verbose=verbose,  # ensure ProgressBar is shown (can be slow)
-        )
+        if cfg.decoding_LOGO:
+            scores = cross_val_multiscore(
+                estimator,
+                X=X,
+                y=y,
+                cv=LeaveOneGroupOut(),
+                groups=epochs.metadata[cfg.decoding_LOGO_group].values,
+                n_jobs=cv_scoring_n_jobs,
+                verbose=False,  # ensure ProgressBar is shown (can be slow)
+            )
+
+        else:
+            cv = StratifiedKFold(
+                shuffle=True,
+                random_state=cfg.random_state,
+                n_splits=cfg.decoding_n_splits,
+            )
+            scores = cross_val_multiscore(
+                estimator,
+                X=X,
+                y=y,
+                cv=cv,
+                n_jobs=cv_scoring_n_jobs,
+                verbose=verbose,  # ensure ProgressBar is shown (can be slow)
+            )
 
         # let's save the scores now
         a_vs_b = f"{cond_names[0]}+{cond_names[1]}".replace(op.sep, "")
@@ -336,6 +367,10 @@ def get_config(
         decoding_time_decim=config.decoding_time_decim,
         decoding_time_generalization=config.decoding_time_generalization,
         decoding_time_generalization_decim=config.decoding_time_generalization_decim,  # noqa: E501
+        decoding_LOGO=config.decoding_LOGO,
+        decoding_LOGO_group=config.decoding_LOGO_group,
+        decoding_baseline=config.decoding_baseline,
+        decoding_equalize=config.decoding_equalize,
         random_state=config.random_state,
         analyze_channels=config.analyze_channels,
         ch_types=config.ch_types,

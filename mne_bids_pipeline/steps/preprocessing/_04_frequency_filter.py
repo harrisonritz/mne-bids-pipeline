@@ -44,6 +44,8 @@ from mne_bids_pipeline._run import (
 from mne_bids_pipeline.typing import InFilesT, IntArrayT, OutFilesT, RunKindT, RunTypeT
 
 
+N_JOBS=-1
+
 def get_input_fnames_frequency_filter(
     *,
     cfg: SimpleNamespace,
@@ -89,7 +91,7 @@ def zapline(
     data = raw.get_data(picks).T  # transpose to (n_samples, n_channels)
     func = dss.dss_line_iter if iter_ else dss.dss_line
     out, _ = func(data, fline, sfreq)
-    raw._data[picks] = out.T  # type: ignore
+    raw._data[picks] = out.T  # type: ignore[invalid-assignment]
 
 
 def notch_filter(
@@ -124,7 +126,7 @@ def notch_filter(
         freqs=freqs,
         trans_bandwidth=trans_bandwidth,
         notch_widths=notch_widths,
-        n_jobs=1,
+        n_jobs=N_JOBS,
         picks=picks,
         **notch_extra_kws,
     )
@@ -166,7 +168,7 @@ def bandpass_filter(
         h_freq=h_freq,
         l_trans_bandwidth=l_trans_bandwidth,
         h_trans_bandwidth=h_trans_bandwidth,
-        n_jobs=1,
+        n_jobs=N_JOBS,
         picks=picks,
         **bandpass_extra_kws,
     )
