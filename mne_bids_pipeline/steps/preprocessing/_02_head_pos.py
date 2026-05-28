@@ -298,6 +298,26 @@ def get_config_twa(
     return cfg
 
 
+def get_config_twa(
+    *,
+    config: SimpleNamespace,
+    subject: str,
+    session: str | None,
+) -> SimpleNamespace:
+    cfg = SimpleNamespace(
+        runs_tasks=get_runs_tasks(
+            config=config,
+            subject=subject,
+            session=session,
+            which=("runs",),
+        ),
+        mf_mc=config.mf_mc,
+        mf_destination=config.mf_destination,
+        **_import_data_kwargs(config=config, subject=subject),
+    )
+    return cfg
+
+
 def main(*, config: SimpleNamespace) -> None:
     """Run head position estimation."""
     if not config.use_maxwell_filter or not config.mf_mc:

@@ -125,8 +125,10 @@ def _import_config(
         # Misc
         "deriv_root",
         "config_path",
+        # Reports
+        "generate_reports",
     ) + extra_exec_params_keys
-    in_both = {"deriv_root"}
+    in_both = {"deriv_root", "generate_reports"}
     exec_params = SimpleNamespace(**{k: getattr(config, k) for k in keys})
     override_keys = ("subjects",)
     exec_params.overrides = SimpleNamespace(
@@ -300,6 +302,23 @@ def _check_config(config: SimpleNamespace, config_path: PathLike | None) -> None
             "bids_root and deriv_root cannot be the same directory "
             f"({config.bids_root})."
         )
+
+    if config.custom_proc is not None:
+        if config.proc is not None:
+            raise ConfigError(
+                "`proc` and `custom_proc` are mutually exclusive: `proc` selects "
+                "files in `bids_root`, while `custom_proc` selects custom-preprocessed "
+                "files in `deriv_root`. Got "
+                f"proc={config.proc!r}, custom_proc={config.custom_proc!r}."
+            )
+        if not isinstance(config.custom_proc, str) or not re.fullmatch(
+            r"[a-zA-Z0-9]+", config.custom_proc
+        ):
+            raise ConfigError(
+                "`custom_proc` must be a non-empty alphanumeric string (BIDS entity "
+                "values cannot contain underscores or hyphens). Got "
+                f"custom_proc={config.custom_proc!r}."
+            )
 
     # tasks
     tasks = get_tasks(config=config)  # will raise if something is wrong

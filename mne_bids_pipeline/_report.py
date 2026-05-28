@@ -28,6 +28,18 @@ from ._logging import _linkfile, gen_log_kwargs, logger
 from .typing import FloatArrayT
 
 
+class _NullReport:
+    """No-op drop-in for ``mne.Report`` used when ``generate_reports=False``.
+
+    Every attribute access returns a callable that silently discards its
+    arguments, so all ``report.add_*(...)`` and ``report.remove(...)`` calls
+    in step code are absorbed without error and without any file I/O.
+    """
+
+    def __getattr__(self, name: str):
+        return lambda *args, **kwargs: None
+
+
 def _report_path(
     *, cfg: SimpleNamespace, subject: str, session: str | None = None
 ) -> BIDSPath:
@@ -61,6 +73,9 @@ def _open_report(
     fname_report: BIDSPath | None = None,
     name: str = "report",
 ) -> Generator[mne.Report, None, None]:
+    if not exec_params.generate_reports:
+        yield _NullReport()  # type: ignore[misc]
+        return
     if fname_report is None:
         fname_report = _report_path(cfg=cfg, subject=subject, session=session)
     fname_report = fname_report.fpath
@@ -963,7 +978,7 @@ def _render_bem(
         subject=cfg.fs_subject,
         subjects_dir=cfg.fs_subjects_dir,
         title="BEM",
-        width=256,
+        width=512,
         decim=8,
         replace=True,
         n_jobs=1,  # prevent automatic parallelization

@@ -130,6 +130,7 @@ def compute_cov_rank_from_epochs(
         else mne.concatenate_epochs(all_epochs, verbose="error")
     )
 
+
     rank = _get_rank(cfg=cfg, subject=subject, session=session, inst=epochs)
     cov = mne.compute_covariance(
         epochs,

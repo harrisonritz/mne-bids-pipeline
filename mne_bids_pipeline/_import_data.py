@@ -186,13 +186,13 @@ def make_epochs(
     # then pass to epochs.drop(); this allows us to specify a custom drop
     # reason.
     if metadata_query is not None:
-        import pandas.core
+        from pandas.errors import UndefinedVariableError
 
         assert epochs.metadata is not None
 
         try:
             idx_keep = epochs.metadata.eval(metadata_query, engine="python")
-        except pandas.core.computation.ops.UndefinedVariableError:
+        except UndefinedVariableError:
             msg = f"Metadata query failed to select any columns: {metadata_query}"
             logger.warning(**gen_log_kwargs(message=msg))
             return epochs
@@ -293,11 +293,22 @@ def _load_data(
     # - sets raw.annotations using the BIDS events.tsv
 
     subject = bids_path.subject
-    raw = read_raw_bids(
-        bids_path=bids_path,
-        extra_params=_get_reader_extra_params(cfg=cfg, bids_path=bids_path),
-        verbose=exec_params.read_raw_bids_verbose,
-    )
+    if (
+        getattr(cfg, "custom_proc", None) is not None
+        and bids_path.root == cfg.deriv_root
+    ):
+        # Custom-preprocessed FIF in deriv_root. deriv_root is not a complete
+        # BIDS dataset (no channels.tsv / events.tsv / *_meg.json next to the
+        # FIF), so read_raw_bids would fail. The FIF is expected to carry its
+        # own bads, channel types, and annotations (the typical way to produce
+        # such a FIF is read_raw_bids -> custom preprocessing -> raw.save()).
+        raw = mne.io.read_raw_fif(bids_path.fpath, **(cfg.reader_extra_params or {}))
+    else:
+        raw = read_raw_bids(
+            bids_path=bids_path,
+            extra_params=_get_reader_extra_params(cfg=cfg, bids_path=bids_path),
+            verbose=exec_params.read_raw_bids_verbose,
+        )
 
     _crop_data(cfg, raw=raw, subject=subject)
 
@@ -537,11 +548,21 @@ def import_er_data(
         return raw_er
 
     # Load reference run plus its auto-bads
-    raw_ref = read_raw_bids(
-        bids_path_ref_in,
-        extra_params=_get_reader_extra_params(cfg=cfg, bids_path=bids_path_ref_in),
-        verbose=exec_params.read_raw_bids_verbose,
-    )
+    if (
+        getattr(cfg, "custom_proc", None) is not None
+        and bids_path_ref_in.root == cfg.deriv_root
+    ):
+        # See _load_data: when reading a custom-preprocessed FIF from deriv_root,
+        # bypass read_raw_bids because the BIDS sidecars don't exist there.
+        raw_ref = mne.io.read_raw_fif(
+            bids_path_ref_in.fpath, **(cfg.reader_extra_params or {})
+        )
+    else:
+        raw_ref = read_raw_bids(
+            bids_path_ref_in,
+            extra_params=_get_reader_extra_params(cfg=cfg, bids_path=bids_path_ref_in),
+            verbose=exec_params.read_raw_bids_verbose,
+        )
     if bids_path_ref_bads_in is not None:
         bads = _read_bads_tsv(
             cfg=cfg,
@@ -626,6 +647,14 @@ def _get_bids_path_in(
         path_kwargs["suffix"] = "raw"
         path_kwargs["extension"] = ".fif"
         path_kwargs["processing"] = kind
+    elif getattr(cfg, "custom_proc", None) is not None:
+        # User has run their own preprocessing and written
+        # *_proc-<custom_proc>_raw.fif files into deriv_root. Read those
+        # instead of the BIDS raw files.
+        path_kwargs["root"] = cfg.deriv_root
+        path_kwargs["suffix"] = "raw"
+        path_kwargs["extension"] = ".fif"
+        path_kwargs["processing"] = cfg.custom_proc
     else:
         path_kwargs["root"] = cfg.bids_root
         path_kwargs["suffix"] = None
@@ -723,10 +752,34 @@ def _get_noise_path(
             task=mf_reference_task,
             kind=kind,
         )
-        raw_fname = _read_json(_empty_room_match_path(raw_fname, cfg))["fname"]
+        if getattr(cfg, "custom_proc", None) is not None:
+            # _02_find_empty_room.py writes the JSON keyed off the bids_root
+            # path of the experimental run; reset entities so we read from
+            # the same location.
+            json_run_path = raw_fname.copy().update(
+                root=cfg.bids_root,
+                processing=cfg.proc,
+                suffix=None,
+                extension=None,
+            )
+        else:
+            json_run_path = raw_fname
+        raw_fname = _read_json(_empty_room_match_path(json_run_path, cfg))["fname"]
         if raw_fname is None:
             return dict()
         raw_fname = get_bids_path_from_fname(raw_fname)
+        if getattr(cfg, "custom_proc", None) is not None:
+            # Auto-fallback: try a custom-preprocessed empty-room FIF in
+            # deriv_root first; fall back to the bids_root path if missing.
+            candidate = raw_fname.copy().update(
+                root=cfg.deriv_root,
+                processing=cfg.custom_proc,
+                suffix="raw",
+                extension=".fif",
+                check=False,
+            )
+            if candidate.fpath.exists():
+                raw_fname = candidate
     return _path_dict(
         cfg=cfg,
         bids_path_in=raw_fname,
@@ -880,6 +933,9 @@ def _import_data_kwargs(
         process_empty_room=config.process_empty_room,
         process_rest=config.process_rest,
         task_is_rest=config.task_is_rest,
+        # _get_bids_path_in, _load_data, _get_noise_path: read raw input from
+        # deriv_root (custom-preprocessed) instead of bids_root.
+        custom_proc=config.custom_proc,
         # _get_raw_paths, _get_noise_path
         use_maxwell_filter=config.use_maxwell_filter,
         mf_reference_run=mf_reference_run,

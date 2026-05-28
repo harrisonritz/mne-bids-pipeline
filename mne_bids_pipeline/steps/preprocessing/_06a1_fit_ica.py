@@ -37,7 +37,6 @@ from mne_bids_pipeline._run import (
 )
 from mne_bids_pipeline.typing import InFilesT, OutFilesT
 
-
 def get_input_fnames_run_ica(
     *,
     cfg: SimpleNamespace,

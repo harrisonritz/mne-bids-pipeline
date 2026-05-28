@@ -14,11 +14,13 @@ from types import SimpleNamespace
 import mne
 import numpy as np
 import pandas as pd
-from mne.decoding import Vectorizer
+from mne.decoding import LinearModel, Vectorizer, get_coef
 from mne_bids import BIDSPath
 from scipy.io import loadmat, savemat
-from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import LeaveOneGroupOut, StratifiedKFold, cross_val_score
 from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
 from mne_bids_pipeline._config_utils import (
     _bids_kwargs,
@@ -46,6 +48,8 @@ from mne_bids_pipeline._run import (
     save_logs,
 )
 from mne_bids_pipeline.typing import InFilesT, OutFilesT
+
+N_JOBS = 1
 
 
 def get_input_fnames_epochs_decoding(
@@ -115,18 +119,32 @@ def run_epochs_decoding(
     # We have to use this approach because the conditions could be based on
     # metadata selection, so simply using epochs[conds[0], conds[1]] would
     # not work.
-    epochs = mne.concatenate_epochs(
-        [epochs[epochs_conds[0]], epochs[epochs_conds[1]]], verbose="error"
-    )
+    if cfg.decoding_equalize:
+        epochs1 = epochs[epochs_conds[0]]
+        epochs2 = epochs[epochs_conds[1]]
+        mne.epochs.equalize_epoch_counts([epochs1, epochs2])
+
+        epochs = mne.concatenate_epochs([epochs1, epochs2], verbose="error")
+        del epochs1, epochs2
+    else:
+        epochs = mne.concatenate_epochs(
+            [epochs[epochs_conds[0]], epochs[epochs_conds[1]]], verbose="error"
+        )
 
     # Crop to the desired analysis interval. Do it only after the concatenation to work
     # around https://github.com/mne-tools/mne-python/issues/12153
     epochs.crop(cfg.decoding_epochs_tmin, cfg.decoding_epochs_tmax)
+
+    if cfg.decoding_baseline is not None:
+        print(f"Applying baseline correction for decoding: {cfg.decoding_baseline}")
+        epochs.apply_baseline(cfg.decoding_baseline)
+
     # omit bad channels and reference MEG sensors
     pick_idx = mne.pick_types(
         epochs.info, meg=True, eeg=True, ref_meg=False, exclude="bads"
     )
     epochs.pick(pick_idx)
+    print("channels: ", epochs.ch_names)
     pre_steps = _decoding_preproc_steps(
         cfg=cfg,
         subject=subject,
@@ -141,6 +159,11 @@ def run_epochs_decoding(
     X = epochs.get_data()
     y = np.r_[np.ones(n_cond1), np.zeros(n_cond2)]
 
+    # clf = make_pipeline(
+    #     *pre_steps,
+    #     Vectorizer(),
+    #     LogReg(random_state=cfg.random_state),
+    # )
     clf = make_pipeline(
         *pre_steps,
         Vectorizer(),
@@ -149,20 +172,38 @@ def run_epochs_decoding(
 
     # Now, actually run the classification, and evaluate it via a
     # cross-validation procedure.
-    cv = StratifiedKFold(
-        shuffle=True,
-        random_state=cfg.random_state,
-        n_splits=cfg.decoding_n_splits,
-    )
-    scores = cross_val_score(
-        estimator=clf,
-        X=X,
-        y=y,
-        cv=cv,
-        scoring="roc_auc",
-        n_jobs=1,
-        error_score="raise",
-    )
+    if cfg.decoding_LOGO:
+        # number of unique groups
+        print(
+            f"Unique groups for LOGO: \
+                {epochs.metadata[cfg.decoding_LOGO_group].unique()}"
+        )
+        scores = cross_val_score(
+            estimator=clf,
+            X=X,
+            y=y,
+            cv=LeaveOneGroupOut(),
+            groups=epochs.metadata[cfg.decoding_LOGO_group].values,
+            scoring="roc_auc",
+            n_jobs=N_JOBS,
+            error_score="raise",
+        )
+
+    else:
+        cv = StratifiedKFold(
+            shuffle=True,
+            random_state=cfg.random_state,
+            n_splits=cfg.decoding_n_splits,
+        )
+        scores = cross_val_score(
+            estimator=clf,
+            X=X,
+            y=y,
+            cv=cv,
+            scoring="roc_auc",
+            n_jobs=N_JOBS,
+            error_score="raise",
+        )
 
     # Save the scores
     a_vs_b = f"{cond_names[0]}+{cond_names[1]}".replace(op.sep, "")
@@ -186,6 +227,45 @@ def run_epochs_decoding(
     )
     tabular_data = pd.DataFrame(tabular_data).T
     tabular_data.to_csv(out_files[tsv_key], sep="\t", index=False)
+
+    # Fit once on all data to get patterns/filters in channel space.
+    # clf = make_pipeline(
+    #     *pre_steps,
+    #     Vectorizer(),
+    #     LinearModel(LogReg(random_state=cfg.random_state)),
+    # )
+    clf = make_pipeline(
+        *pre_steps,
+        Vectorizer(),
+        LinearModel(LogReg(random_state=cfg.random_state)),
+    )
+    clf.fit(X, y)
+    n_ch, n_times = X.shape[1], X.shape[2]
+    patterns = get_coef(clf, attr="patterns_", inverse_transform=True)
+    filters = get_coef(clf, attr="filters_", inverse_transform=True)
+    patterns = patterns.reshape(n_ch, n_times)
+    filters = filters.reshape(n_ch, n_times)
+
+    weights_processing = f"{processing}+weights"
+    weights_processing = weights_processing.replace("_", "-").replace("-", "")
+    weights_key = f"tsv_weights_{weights_processing}"
+    out_files[weights_key] = bids_path.copy().update(
+        suffix="decoding", processing=weights_processing, extension=".tsv"
+    )
+
+    weights_frames = []
+    for kind, coef in ("patterns", patterns), ("filters", filters):
+        df = pd.DataFrame(coef, index=epochs.ch_names, columns=epochs.times)
+        df.index.name = "ch_name"
+        df = df.reset_index().melt(
+            id_vars="ch_name",
+            var_name="time",
+            value_name="value",
+        )
+        df.insert(0, "kind", kind)
+        weights_frames.append(df)
+    weights_df = pd.concat(weights_frames, ignore_index=True)
+    weights_df.to_csv(out_files[weights_key], sep="\t", index=False)
 
     # Report
     with _open_report(
@@ -233,6 +313,42 @@ def run_epochs_decoding(
         # close figure to save memory
         plt.close(fig)
 
+        for ch_type in ("mag", "grad", "eeg"):
+            picks = mne.pick_types(
+                epochs.info,
+                meg=ch_type if ch_type in ("mag", "grad") else False,
+                eeg=ch_type == "eeg",
+                exclude=(),
+            )
+            if len(picks) == 0:
+                continue
+            info = mne.pick_info(epochs.info, picks)
+            for kind, coef in ("patterns", patterns), ("filters", filters):
+                evoked = mne.EvokedArray(coef[picks], info, tmin=epochs.tmin)
+                fig = evoked.plot_topomap(times="auto", show=False, ch_type=ch_type)
+                report.add_figure(
+                    fig=fig,
+                    title=f"Full-epochs {kind} ({ch_type})",
+                    caption=(
+                        "Topographic maps for full-epochs decoding, derived from "
+                        "channel-space coefficients."
+                    ),
+                    section="Decoding: full-epochs",
+                    tags=(
+                        "epochs",
+                        "contrast",
+                        "decoding",
+                        kind,
+                        ch_type,
+                        *[
+                            f"{_sanitize_cond_tag(cond_1)}–{_sanitize_cond_tag(cond_2)}"
+                            for cond_1, cond_2 in cfg.contrasts
+                        ],
+                    ),
+                    replace=True,
+                )
+                plt.close(fig)
+
     assert len(in_files) == 0, in_files.keys()
     return _prep_out_files(exec_params=exec_params, out_files=out_files)
 
@@ -252,6 +368,10 @@ def get_config(
         decoding_epochs_tmin=config.decoding_epochs_tmin,
         decoding_epochs_tmax=config.decoding_epochs_tmax,
         decoding_n_splits=config.decoding_n_splits,
+        decoding_LOGO=config.decoding_LOGO,
+        decoding_LOGO_group=config.decoding_LOGO_group,
+        decoding_baseline=config.decoding_baseline,
+        decoding_equalize=config.decoding_equalize,
         random_state=config.random_state,
         analyze_channels=config.analyze_channels,
         ch_types=config.ch_types,

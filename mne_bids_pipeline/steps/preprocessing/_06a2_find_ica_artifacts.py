@@ -7,6 +7,9 @@ To actually remove designated ICA components from your data, you will have to
 run the apply_ica step.
 """
 
+import os
+import pathlib
+import shutil
 from types import SimpleNamespace
 from typing import Literal
 
@@ -26,7 +29,7 @@ from mne_bids_pipeline._config_utils import (
 )
 from mne_bids_pipeline._logging import gen_log_kwargs, logger
 from mne_bids_pipeline._parallel import get_parallel_backend, parallel_func
-from mne_bids_pipeline._report import _open_report
+from mne_bids_pipeline._report import _agg_backend, _open_report
 from mne_bids_pipeline._run import (
     _prep_out_files,
     _update_for_splits,
@@ -34,6 +37,131 @@ from mne_bids_pipeline._run import (
     save_logs,
 )
 from mne_bids_pipeline.typing import FloatArrayT, InFilesT, OutFilesT
+
+N_JOBS=-1
+
+# ---------------------------------------------------------------------------
+# Per-component timeout (seconds) for plot_properties + savefig.
+# Set to 0 or None to disable.
+# ---------------------------------------------------------------------------
+_ICA_PROPERTY_TIMEOUT: int | None = 120
+
+
+def _get_ica_scratch_dir(ica_out_dir: pathlib.Path) -> pathlib.Path | None:
+    """Return a node-local scratch directory for ICA figure I/O.
+
+    Checks (in order): ICA_FIG_SCRATCH, SLURM_TMPDIR, TMPDIR, /tmp.
+    Returns None only if ICA_FIG_SCRATCH is explicitly set to "0" or "off".
+    """
+    # Allow explicit opt-out
+    explicit = os.environ.get("ICA_FIG_SCRATCH", "")
+    if explicit.lower() in ("0", "off", "false", "no"):
+        return None
+
+    candidates = [
+        os.environ.get("ICA_FIG_SCRATCH"),
+        os.environ.get("SLURM_TMPDIR"),
+        os.environ.get("TMPDIR"),
+        "/tmp",
+    ]
+    for candidate in candidates:
+        if candidate is not None:
+            p = pathlib.Path(candidate)
+            if p.is_dir() and os.access(p, os.W_OK):
+                scratch = p / f"ica_figs_{os.getpid()}"
+                scratch.mkdir(parents=True, exist_ok=True)
+                return scratch
+    return None
+
+
+def _sync_ica_scratch_to_gpfs(
+    scratch_dir: pathlib.Path,
+    gpfs_dir: pathlib.Path,
+) -> None:
+    """Copy all files from *scratch_dir* to *gpfs_dir*, then clean up."""
+    gpfs_dir.mkdir(parents=True, exist_ok=True)
+    for src in scratch_dir.iterdir():
+        if src.is_file():
+            dst = gpfs_dir / src.name
+            # Atomic-ish: write to tmp, then rename
+            dst_tmp = dst.with_suffix(dst.suffix + f".tmp.{os.getpid()}")
+            try:
+                shutil.copy2(src, dst_tmp)
+                os.replace(dst_tmp, dst)
+            except BaseException:
+                dst_tmp.unlink(missing_ok=True)
+                raise
+    # Clean up scratch
+    shutil.rmtree(scratch_dir, ignore_errors=True)
+
+
+def _plot_property_with_timeout(
+    ica,
+    epochs,
+    pick: int,
+    bids_basename_for_figs,
+    ica_out_dir: pathlib.Path,
+    timeout: int | None,
+):
+    """Plot a single IC's properties and save to disk, with optional timeout.
+
+    Uses signal.alarm (SIGALRM) for the timeout since this runs in the
+    main process and avoids multiprocessing overhead.
+    """
+    import signal
+    import matplotlib.pyplot as plt
+
+    timed_out = False
+
+    def _alarm_handler(signum, frame):
+        raise TimeoutError(f"IC {pick:03d} plot_properties timed out after {timeout}s")
+
+    # Set alarm if timeout is enabled and we're on a POSIX system
+    old_handler = None
+    if timeout and hasattr(signal, "SIGALRM"):
+        old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
+        signal.alarm(timeout)
+
+    try:
+        figs_props = ica.plot_properties(inst=epochs, picks=pick, show=False)
+        if not isinstance(figs_props, list):
+            figs_props = [figs_props]
+        for fig in figs_props:
+            suffix = f"icaProperties{pick:03d}"
+            fig_path = _ica_fig_path(
+                bids_basename_for_figs, ica_out_dir, "ica", suffix
+            )
+            fig.savefig(fig_path, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+    except TimeoutError:
+        timed_out = True
+        logger.warning(
+            **gen_log_kwargs(
+                message=f"⏱ IC {pick:03d}: timed out after {timeout}s, skipping."
+            )
+        )
+    finally:
+        # Cancel alarm and restore handler
+        if timeout and hasattr(signal, "SIGALRM"):
+            signal.alarm(0)
+            if old_handler is not None:
+                signal.signal(signal.SIGALRM, old_handler)
+
+    return not timed_out
+
+
+def _ica_fig_path(
+    bids_basename: BIDSPath,
+    ica_out_dir: pathlib.Path,
+    processing: str,
+    suffix: str,
+    extension: str = ".png",
+) -> pathlib.Path:
+    """Build a BIDS-style filename in the ICA output directory."""
+    bp = bids_basename.copy().update(
+        processing=processing, suffix=suffix, extension=extension
+    )
+    return ica_out_dir / bp.basename
 
 
 def detect_bad_components(
@@ -153,6 +281,11 @@ def find_ica_artifacts(
     out_files_components = bids_basename.copy().update(
         processing="ica", suffix="components", extension=".tsv"
     )
+
+    # ICA figure/array output directory
+    ica_out_dir = out_files["ica"].fpath.parent / "ICA"
+    ica_out_dir.mkdir(exist_ok=True, parents=True)
+    bids_basename_for_figs = bids_basename.copy()
     del bids_basename
     msg = "Loading ICA solution"
     logger.info(**gen_log_kwargs(message=msg))
@@ -384,6 +517,197 @@ def find_ica_artifacts(
             tags=tags,
         )
 
+    # Export ICA figures as PNGs and scores as NPY arrays
+    logger.info(**gen_log_kwargs(message="Saving ICA figures to PNG files."))
+
+    # Option 2: Use node-local scratch to avoid GPFS I/O stalls
+    scratch_dir = _get_ica_scratch_dir(ica_out_dir)
+    if scratch_dir is not None:
+        fig_out_dir = scratch_dir
+        logger.info(
+            **gen_log_kwargs(
+                message=f"Using local scratch for ICA figures: {scratch_dir}"
+            )
+        )
+    else:
+        fig_out_dir = ica_out_dir
+
+    with _agg_backend():
+        import matplotlib.pyplot as plt
+
+        # --- Component topographies ---
+        figs = ica.plot_components(colorbar=True, show=False)
+        if not isinstance(figs, list):
+            figs = [figs]
+        for fi, fig in enumerate(figs):
+            suffix = "icaComponents" if fi == 0 else f"icaComponents{fi + 1}"
+            fig_path = _ica_fig_path(
+                bids_basename_for_figs, fig_out_dir, "ica", suffix
+            )
+            fig.savefig(fig_path, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+
+        # --- Component properties (with per-component timeout) ---
+        if cfg.ica_plot_component_properties == "all":
+            props_picks = list(range(ica.n_components_))
+        else:  # "excluded"
+            props_picks = list(ica.exclude)
+
+        n_ok, n_timeout = 0, 0
+        for pick in props_picks:
+            ok = _plot_property_with_timeout(
+                ica=ica,
+                epochs=epochs,
+                pick=pick,
+                bids_basename_for_figs=bids_basename_for_figs,
+                ica_out_dir=fig_out_dir,
+                timeout=_ICA_PROPERTY_TIMEOUT,
+            )
+            if ok:
+                n_ok += 1
+            else:
+                n_timeout += 1
+
+        msg = (
+            f"Component properties: {n_ok}/{len(props_picks)} saved"
+            + (f" ({n_timeout} timed out)" if n_timeout else "")
+        )
+        logger.info(**gen_log_kwargs(message=msg))
+
+        # save sensor names for matching to scores
+        sensor_names_path = _ica_fig_path(
+            bids_basename_for_figs, fig_out_dir, "ica", "sensorNames", ".tsv"
+        )
+        pd.DataFrame({"sensor": ica.ch_names}).to_csv(sensor_names_path, sep="\t", index=False)
+
+        # --- IC sensor maps (mixing matrix topographies) ---
+        ic_maps = ica.get_components()  # [n_channels, n_components]
+        ic_labels = [f"IC{i:03d}" for i in range(ica.n_components_)]
+        ic_maps_df = pd.DataFrame(
+            ic_maps, columns=ic_labels, index=ica.ch_names
+        )
+        ic_maps_path = _ica_fig_path(
+            bids_basename_for_figs, fig_out_dir, "ica", "icaSensorMaps", ".tsv"
+        )
+        ic_maps_df.to_csv(ic_maps_path, sep="\t", index_label="sensor")
+
+        # Z-score sensor maps per IC (across channels) for weighted maps
+        ic_std = ic_maps.std(axis=0, keepdims=True)
+        ic_std[ic_std == 0] = 1  # avoid division by zero
+        ic_maps_z = (ic_maps - ic_maps.mean(axis=0, keepdims=True)) / ic_std
+
+        # --- ECG scores ---
+        if len(ecg_scores) > 0:
+            fig = ica.plot_scores(scores=ecg_scores, labels="ecg", show=False)
+            fig_path = _ica_fig_path(
+                bids_basename_for_figs, fig_out_dir, "ica+ecg", "icaScores"
+            )
+            fig.savefig(fig_path, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+
+            # Save ECG scores as TSV [n_IC, 1]
+            ecg_scores_1d = ecg_scores.ravel()
+            ecg_scores_df = pd.DataFrame(
+                {"score": ecg_scores_1d}, index=ic_labels
+            )
+            ecg_scores_df.index.name = "component"
+            tsv_path = _ica_fig_path(
+                bids_basename_for_figs, fig_out_dir, "ica+ecg", "icaScores", ".tsv"
+            )
+            ecg_scores_df.to_csv(tsv_path, sep="\t")
+
+            # Save score-weighted z-scored sensor maps [n_channels, n_IC]
+            ecg_weighted = ic_maps_z * ecg_scores_1d[np.newaxis, :]
+            ecg_weighted_df = pd.DataFrame(
+                ecg_weighted, columns=ic_labels, index=ica.ch_names
+            )
+            weighted_path = _ica_fig_path(
+                bids_basename_for_figs,
+                fig_out_dir,
+                "ica+ecg",
+                "icaWeightedMaps",
+                ".tsv",
+            )
+            ecg_weighted_df.to_csv(weighted_path, sep="\t", index_label="sensor")
+
+        # --- EOG scores ---
+        if len(eog_scores) > 0:
+            fig = ica.plot_scores(scores=eog_scores, labels="eog", show=False)
+            fig_path = _ica_fig_path(
+                bids_basename_for_figs, fig_out_dir, "ica+eog", "icaScores"
+            )
+            fig.savefig(fig_path, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+
+            # Save EOG scores as TSV [n_IC, 1]
+            # If multi-channel EOG, pick the channel with max abs correlation
+            # find_bads_eog returns a list of arrays (one per channel) when
+            # ch_name is a list; convert to ndarray so .ndim works correctly.
+            eog_scores = np.array(eog_scores)
+            if eog_scores.ndim > 1:
+                best_ch = np.argmax(np.abs(eog_scores), axis=0, keepdims=True)
+                eog_scores_1d = np.take_along_axis(
+                    eog_scores, best_ch, axis=0
+                ).ravel()
+            else:
+                eog_scores_1d = eog_scores
+            eog_scores_df = pd.DataFrame(
+                {"score": eog_scores_1d}, index=ic_labels
+            )
+            eog_scores_df.index.name = "component"
+            tsv_path = _ica_fig_path(
+                bids_basename_for_figs, fig_out_dir, "ica+eog", "icaScores", ".tsv"
+            )
+            eog_scores_df.to_csv(tsv_path, sep="\t")
+
+            # Save score-weighted z-scored sensor maps [n_channels, n_IC]
+            eog_weighted = ic_maps_z * eog_scores_1d[np.newaxis, :]
+            eog_weighted_df = pd.DataFrame(
+                eog_weighted, columns=ic_labels, index=ica.ch_names
+            )
+            weighted_path = _ica_fig_path(
+                bids_basename_for_figs,
+                fig_out_dir,
+                "ica+eog",
+                "icaWeightedMaps",
+                ".tsv",
+            )
+            eog_weighted_df.to_csv(weighted_path, sep="\t", index_label="sensor")
+
+        # --- ECG sources ---
+        if ecg_evoked is not None:
+            fig = ica.plot_sources(inst=ecg_evoked, show=False)
+            fig_path = _ica_fig_path(
+                bids_basename_for_figs, fig_out_dir, "ica+ecg", "icaSources"
+            )
+            fig.savefig(fig_path, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+
+        # --- EOG sources ---
+        if eog_evoked is not None:
+            fig = ica.plot_sources(inst=eog_evoked, show=False)
+            fig_path = _ica_fig_path(
+                bids_basename_for_figs, fig_out_dir, "ica+eog", "icaSources"
+            )
+            fig.savefig(fig_path, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+
+        # --- ICA overlay (original vs cleaned signal) ---
+        fig = ica.plot_overlay(inst=epochs.average(), show=False, on_baseline="reapply")
+        fig_path = _ica_fig_path(
+            bids_basename_for_figs, fig_out_dir, "ica", "icaOverlay"
+        )
+        fig.savefig(fig_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
+    # Sync local scratch files to GPFS (single batch copy)
+    if scratch_dir is not None:
+        logger.info(
+            **gen_log_kwargs(message="Syncing ICA figures from local scratch to GPFS.")
+        )
+        _sync_ica_scratch_to_gpfs(scratch_dir, ica_out_dir)
+        logger.info(**gen_log_kwargs(message="ICA figure sync complete."))
+
         if cfg.ica_use_icalabel:
             _add_report_icalabel(
                 report=report,
@@ -475,9 +799,7 @@ def _run_icalabel(
         f"component{_pl(icalabel_ics)} in {len(epochs)} epochs."
     )
     logger.info(**gen_log_kwargs(message=msg))
-    icalabel_df = pd.DataFrame(
-        icalabel_class_probabilities, columns=np.array(_ICALABEL_CLASSES)
-    )
+    icalabel_df = pd.DataFrame(icalabel_class_probabilities, columns=_ICALABEL_CLASSES)
 
     icalabel_df["Component"] = [
         f"ICA{i:03d}" for i in range(len(icalabel_component_labels))
@@ -592,6 +914,7 @@ def get_config(
         ica_icalabel_include=config.ica_icalabel_include,
         ica_exclusion_thresholds=config.ica_exclusion_thresholds,
         ica_class_thresholds=config.ica_class_thresholds,
+        ica_plot_component_properties=config.ica_plot_component_properties,
         ch_types=config.ch_types,
         eeg_reference=get_eeg_reference(config),
         eog_channels=config.eog_channels,
