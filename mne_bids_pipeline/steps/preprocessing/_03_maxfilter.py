@@ -636,7 +636,7 @@ def get_config_maxwell_filter(
         mf_esss=config.mf_esss,
         mf_extra_kws=config.mf_extra_kws,
         generate_reports=getattr(config, "generate_reports", True),
-        **_import_data_kwargs(config=config, subject=subject, session=session),
+        **_import_data_kwargs(config=config, subject=subject),
     )
     return cfg
 

@@ -385,7 +385,7 @@ def get_config(
         # find_noisy_channels_meg=config.find_noisy_channels_meg,
         # find_bad_channels_extra_kws=config.find_bad_channels_extra_kws,
         generate_reports=getattr(config, "generate_reports", True),
-        **_import_data_kwargs(config=config, subject=subject, session=session),
+        **_import_data_kwargs(config=config, subject=subject),
         **extra_kwargs,
     )
     return cfg
