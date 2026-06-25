@@ -562,26 +562,30 @@ def run_maxwell_filter(
         raw_sss.plot(n_channels=50, butterfly=True, block=True)
 
     # Reporting
-    with _open_report(
-        cfg=cfg,
-        exec_params=exec_params,
-        subject=subject,
-        session=session,
-        run=run,
-        task=task,
-    ) as report:
-        msg = "Adding Maxwell filtered raw data to report."
-        logger.info(**gen_log_kwargs(message=msg))
-
-        _add_raw(
+    if cfg.generate_reports:
+        with _open_report(
             cfg=cfg,
-            report=report,
-            bids_path_in=out_files["sss_raw"],
-            title="Raw (maxwell filtered)",
-            tags=("sss",),
-            raw=raw_sss,
-            extra_html=extra_html,
-        )
+            exec_params=exec_params,
+            subject=subject,
+            session=session,
+            run=run,
+            task=task,
+        ) as report:
+            msg = "Adding Maxwell filtered raw data to report."
+            logger.info(**gen_log_kwargs(message=msg))
+
+            _add_raw(
+                cfg=cfg,
+                report=report,
+                bids_path_in=out_files["sss_raw"],
+                title="Raw (maxwell filtered)",
+                tags=("sss",),
+                raw=raw_sss,
+                extra_html=extra_html,
+            )
+    else:
+        msg = "Skipping report generation"
+        logger.info(**gen_log_kwargs(message=msg))
 
     assert len(in_files) == 0, in_files.keys()
     return _prep_out_files(exec_params=exec_params, out_files=out_files)
@@ -631,7 +635,8 @@ def get_config_maxwell_filter(
         mf_mc_translation_velocity_limit=config.mf_mc_translation_velocity_limit,
         mf_esss=config.mf_esss,
         mf_extra_kws=config.mf_extra_kws,
-        **_import_data_kwargs(config=config, subject=subject),
+        generate_reports=getattr(config, "generate_reports", True),
+        **_import_data_kwargs(config=config, subject=subject, session=session),
     )
     return cfg
 

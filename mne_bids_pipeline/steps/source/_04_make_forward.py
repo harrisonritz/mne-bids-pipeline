@@ -214,32 +214,36 @@ def run_forward(
     mne.write_forward_solution(out_files["forward"], fwd, overwrite=True)
 
     # Report
-    with _open_report(
-        cfg=cfg, exec_params=exec_params, subject=subject, session=session
-    ) as report:
-        msg = "Adding forward information to report"
+    if cfg.generate_reports:
+        with _open_report(
+            cfg=cfg, exec_params=exec_params, subject=subject, session=session
+        ) as report:
+            msg = "Adding forward information to report"
+            logger.info(**gen_log_kwargs(message=msg))
+            _render_bem(report=report, cfg=cfg, subject=subject, session=session)
+            msg = "Rendering sensor alignment (coregistration)"
+            logger.info(**gen_log_kwargs(message=msg))
+            report.add_trans(
+                trans=trans,
+                info=info,
+                title="Sensor alignment",
+                subject=cfg.fs_subject,
+                subjects_dir=cfg.fs_subjects_dir,
+                alpha=1,
+                replace=True,
+            )
+            msg = "Rendering forward solution"
+            logger.info(**gen_log_kwargs(message=msg))
+            report.add_forward(
+                forward=fwd,
+                title="Forward solution",
+                subject=cfg.fs_subject,
+                subjects_dir=cfg.fs_subjects_dir,
+                replace=True,
+            )
+    else:
+        msg = "Skipping report generation"
         logger.info(**gen_log_kwargs(message=msg))
-        _render_bem(report=report, cfg=cfg, subject=subject, session=session)
-        msg = "Rendering sensor alignment (coregistration)"
-        logger.info(**gen_log_kwargs(message=msg))
-        report.add_trans(
-            trans=trans,
-            info=info,
-            title="Sensor alignment",
-            subject=cfg.fs_subject,
-            subjects_dir=cfg.fs_subjects_dir,
-            alpha=1,
-            replace=True,
-        )
-        msg = "Rendering forward solution"
-        logger.info(**gen_log_kwargs(message=msg))
-        report.add_forward(
-            forward=fwd,
-            title="Forward solution",
-            subject=cfg.fs_subject,
-            subjects_dir=cfg.fs_subjects_dir,
-            replace=True,
-        )
 
     assert len(in_files) == 0, in_files
     return _prep_out_files(exec_params=exec_params, out_files=out_files)
@@ -280,6 +284,7 @@ def get_config(
         fs_subjects_dir=get_fs_subjects_dir(config),
         t1_bids_path=t1_bids_path,
         landmarks_kind=landmarks_kind,
+        generate_reports=getattr(config, "generate_reports", True),
         **_bids_kwargs(config=config),
     )
     return cfg

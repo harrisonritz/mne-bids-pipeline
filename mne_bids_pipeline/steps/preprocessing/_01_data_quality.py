@@ -200,19 +200,20 @@ def assess_data_quality(
     # Restore bads to their original state so they will show up in the report
     raw.info["bads"] = preexisting_bads
 
-    with _open_report(
-        cfg=cfg,
-        exec_params=exec_params,
-        subject=subject,
-        session=session,
-        run=run,
-        task=task,
-    ) as report:
-        # Original data
-        kind = getattr(cfg, "custom_proc", None) or cfg.proc or "original"
-        msg = f"Adding {kind} raw data to report"
-        logger.info(**gen_log_kwargs(message=msg))
-        _add_raw(
+    if cfg.generate_reports:
+        with _open_report(
+            cfg=cfg,
+            exec_params=exec_params,
+            subject=subject,
+            session=session,
+            run=run,
+            task=task,
+        ) as report:
+            # Original data
+            kind = getattr(cfg, "custom_proc", None) or cfg.proc or "original"
+            msg = f"Adding {kind} raw data to report"
+            logger.info(**gen_log_kwargs(message=msg))
+            _add_raw(
             cfg=cfg,
             report=report,
             bids_path_in=bids_path_in,
@@ -221,48 +222,62 @@ def assess_data_quality(
             tags=("data-quality",),
         )
 
-        tags = ("raw", "data-quality", f"run-{run}")
-        text_html = (
-            '<p class="mb-0">Bad channels marked in original data:</p>\n'
-            f"{_chs_html(preexisting_bads)}"
-        )
-        text_kwargs = dict(
-            title=f"Bad channels: {run}",
-            section="Data quality",
-            tags=tags,
-            replace=True,
-        )
-        title = f"Bad channel detection: {run}"
-        if cfg.find_noisy_channels_meg:
-            assert auto_scores is not None
-            msg = "Adding noisy channel detection to report"
-            logger.info(**gen_log_kwargs(message=msg))
-            if cfg.find_noisy_channels_meg:
-                text_html += (
-                    '<hr>\n<p class="mb-0">Automatically detected noisy channels:</p>\n'
-                    f"{_chs_html(auto_noisy_chs)}"
-                )
-            if cfg.find_flat_channels_meg:
-                text_html += (
-                    '<hr>\n<p class="mb-0">Automatically detected flat channels:</p>\n'
-                    f"{_chs_html(auto_flat_chs)}"
-                )
-            report.add_html(text_html, **text_kwargs)
-            figs = plot_auto_scores(auto_scores, ch_types=cfg.ch_types)
-            captions = [f"Run {run}"] * len(figs)
-            report.add_figure(
-                fig=figs,
-                caption=captions,
+            tags = ("raw", "data-quality", f"run-{run}")
+            text_html = (
+                '<p class="mb-0">Bad channels marked in original data:</p>\n'
+                f"{_chs_html(preexisting_bads)}"
+            )
+            text_kwargs = dict(
+                title=f"Bad channels: {run}",
                 section="Data quality",
-                title=title,
                 tags=tags,
                 replace=True,
             )
-            for fig in figs:
-                plt.close(fig)
-        else:
-            report.remove(title=title)
-            report.add_html(text_html, **text_kwargs)
+            title = f"Bad channel detection: {run}"
+            if cfg.find_noisy_channels_meg:
+                assert auto_scores is not None
+                msg = "Adding noisy channel detection to report"
+                logger.info(**gen_log_kwargs(message=msg))
+                if cfg.find_noisy_channels_meg:
+                    text_html += (
+                        '<hr>\n<p class="mb-0">Automatically detected noisy channels:</p>\n'
+                        f"{_chs_html(auto_noisy_chs)}"
+                    )
+                if cfg.find_flat_channels_meg:
+                    text_html += (
+                        '<hr>\n<p class="mb-0">Automatically detected flat channels:</p>\n'
+                        f"{_chs_html(auto_flat_chs)}"
+                    )
+                report.add_html(text_html, **text_kwargs)
+                figs = plot_auto_scores(auto_scores, ch_types=cfg.ch_types)
+                captions = [f"Run {run}"] * len(figs)
+                report.add_figure(
+                    fig=figs,
+                    caption=captions,
+                    section="Data quality",
+                    title=title,
+                    tags=tags,
+                    replace=True,
+                )
+                for fig in figs:
+                    plt.close(fig)
+            else:
+                report.remove(title=title)
+                report.add_html(text_html, **text_kwargs)
+
+            # Since "Data quality" has its own section, it should be added first, then
+            # each raw will create its own new section due to how _add_raw works
+            _add_raw(
+                cfg=cfg,
+                report=report,
+                bids_path_in=bids_path_in,
+                raw=raw,
+                title=f"Raw ({kind})",
+                tags=("data-quality",),
+            )
+    else:
+        msg = "Skipping report generation"
+        logger.info(**gen_log_kwargs(message=msg))
 
     assert len(in_files) == 0, in_files.keys()
     return _prep_out_files(exec_params=exec_params, out_files=out_files)
@@ -369,7 +384,8 @@ def get_config(
         # find_flat_channels_meg=config.find_flat_channels_meg,
         # find_noisy_channels_meg=config.find_noisy_channels_meg,
         # find_bad_channels_extra_kws=config.find_bad_channels_extra_kws,
-        **_import_data_kwargs(config=config, subject=subject),
+        generate_reports=getattr(config, "generate_reports", True),
+        **_import_data_kwargs(config=config, subject=subject, session=session),
         **extra_kwargs,
     )
     return cfg

@@ -312,24 +312,28 @@ def filter_data(
         raw.plot(n_channels=50, butterfly=True)
         raw.compute_psd(fmax=fmax).plot()
 
-    with _open_report(
-        cfg=cfg,
-        exec_params=exec_params,
-        subject=subject,
-        session=session,
-        run=run,
-        task=task,
-    ) as report:
-        msg = "Adding filtered raw data to report"
-        logger.info(**gen_log_kwargs(message=msg))
-        _add_raw(
+    if cfg.generate_reports:
+        with _open_report(
             cfg=cfg,
-            report=report,
-            bids_path_in=out_files[in_key],
-            title="Raw (filtered)",
-            tags=("filtered",),
-            raw=raw,
-        )
+            exec_params=exec_params,
+            subject=subject,
+            session=session,
+            run=run,
+            task=task,
+        ) as report:
+            msg = "Adding filtered raw data to report"
+            logger.info(**gen_log_kwargs(message=msg))
+            _add_raw(
+                cfg=cfg,
+                report=report,
+                bids_path_in=out_files[in_key],
+                title="Raw (filtered)",
+                tags=("filtered",),
+                raw=raw,
+            )
+    else:
+        msg = "Skipping report generation"
+        logger.info(**gen_log_kwargs(message=msg))
 
     assert len(in_files) == 0, in_files.keys()
     return _prep_out_files(exec_params=exec_params, out_files=out_files)
@@ -354,6 +358,7 @@ def get_config(
         regress_artifact=config.regress_artifact,
         notch_extra_kws=config.notch_extra_kws,
         bandpass_extra_kws=config.bandpass_extra_kws,
+        generate_reports=getattr(config, "generate_reports", True),
         **_import_data_kwargs(config=config, subject=subject),
     )
     return cfg
