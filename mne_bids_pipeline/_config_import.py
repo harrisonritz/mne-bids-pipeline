@@ -2,6 +2,7 @@ import ast
 import copy
 import difflib
 import importlib.util
+import inspect
 import os
 import pathlib
 import re
@@ -12,13 +13,19 @@ from inspect import signature
 from types import SimpleNamespace
 from typing import Any
 
-import matplotlib
 import mne
 import numpy as np
 from mne_bids import get_entity_vals
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from ._config_utils import get_eog_channels, get_subjects_sessions
+from ._config_utils import (
+    _get_task_baseline,
+    _get_task_float,
+    _validate_contrasts,
+    get_eog_channels,
+    get_subjects_sessions,
+    get_tasks,
+)
 from ._logging import gen_log_kwargs, logger
 from .typing import PathLike
 
@@ -32,6 +39,7 @@ def _import_config(
     config_path: PathLike | None,
     overrides: SimpleNamespace | None = None,
     check: bool = True,
+    add_all_tasks: bool = True,
 ) -> SimpleNamespace:
     """Import the default config and the user's config."""
     # Get the default
@@ -91,9 +99,6 @@ def _import_config(
     # Finally, reduce to our actual supported params (all keep_names should be present)
     config = SimpleNamespace(**{k: getattr(config, k) for k in keep_names})
 
-    # Take some standard actions
-    mne.set_log_level(verbose=config.mne_log_level.upper())
-
     # Take variables out of config (which affects the pipeline outputs) and
     # put into config.exec_params (which affect the pipeline execution methods,
     # but not the outputs)
@@ -104,6 +109,8 @@ def _import_config(
         "dask_temp_dir",
         "dask_worker_memory_limit",
         "dask_open_dashboard",
+        "dask_cluster",
+        "dask_worker_startup_timeout",
         # Interaction
         "on_error",
         "interactive",
@@ -112,6 +119,11 @@ def _import_config(
         "memory_subdir",
         "memory_verbose",
         "memory_file_method",
+        # Logging
+        "log_level",
+        "mne_log_level",
+        "ignore_warnings",
+        "read_raw_bids_verbose",
         # Misc
         "deriv_root",
         "config_path",
@@ -128,6 +140,15 @@ def _import_config(
         if k not in in_both:
             delattr(config, k)
     config.exec_params = exec_params
+
+    # And we need these for some steps, too
+    if add_all_tasks:
+        config.all_tasks = get_tasks(config=config)
+
+    # Take some standard actions
+    mne.set_log_level(verbose=exec_params.mne_log_level.upper())
+    logger.level = exec_params.log_level
+
     return config
 
 
@@ -226,11 +247,12 @@ def _update_with_user_config(
     # 3. Overrides via command-line switches
     overrides = overrides or SimpleNamespace()
     for name in dir(overrides):
-        if not name.startswith("__"):
-            val = getattr(overrides, name)
-            msg = f"Overriding config.{name} = {repr(val)}"
-            logger.info(**gen_log_kwargs(message=msg, emoji="override"))
-            setattr(config, name, val)
+        if name.startswith("__"):
+            continue
+        val = getattr(overrides, name)
+        msg = f"Overriding config.{name} = {repr(val)}"
+        logger.info(**gen_log_kwargs(message=msg, emoji="override"))
+        setattr(config, name, val)
 
     # 4. Env vars and other triaging
     if not config.bids_root:
@@ -255,6 +277,8 @@ def _update_with_user_config(
             logger.info(**gen_log_kwargs(message=msg, **log_kwargs))
         config.on_error = "debug"
     else:
+        import matplotlib
+
         matplotlib.use("Agg")  # do not open any window  # noqa
     if config.on_error == "debug":
         if config.n_jobs != 1:
@@ -276,7 +300,31 @@ def _check_config(config: SimpleNamespace, config_path: PathLike | None) -> None
     # Eventually all of these could be pydantic-validated, but for now we'll
     # just change the ones that are easy
 
+    # fill in missing keys; per-key value constraints are beyond the dict annotation
+    config.report_image_format = (
+        dict(raster="webp", vector="svg") | config.report_image_format
+    )
+    if config.report_image_format["raster"] == "svg":
+        raise ConfigError(
+            'report_image_format["raster"] cannot be "svg"; pixel-based report '
+            'content (sliders, topographic maps, ...) requires "webp", '
+            '"webp-lossy", or "png".'
+        )
+    if "webp-lossy" in config.report_image_format.values():
+        from mne.report.report import _ALLOWED_IMAGE_FORMATS  # slow import, defer
+
+        # fail here rather than partway through the first report-writing step
+        if "webp-lossy" not in _ALLOWED_IMAGE_FORMATS:
+            raise ConfigError(
+                'report_image_format value "webp-lossy" requires MNE-Python >= 1.13.'
+            )
+
     config.bids_root.resolve(strict=True)
+    if config.bids_root == config.deriv_root:
+        raise ValueError(
+            "bids_root and deriv_root cannot be the same directory "
+            f"({config.bids_root})."
+        )
 
     if config.custom_proc is not None:
         if config.proc is not None:
@@ -295,6 +343,10 @@ def _check_config(config: SimpleNamespace, config_path: PathLike | None) -> None
                 f"custom_proc={config.custom_proc!r}."
             )
 
+    # tasks
+    tasks = get_tasks(config=config)  # will raise if something is wrong
+
+    # preprocessing
     if (
         config.use_maxwell_filter
         and len(set(config.ch_types).intersection(("meg", "grad", "mag"))) == 0
@@ -319,6 +371,13 @@ def _check_config(config: SimpleNamespace, config_path: PathLike | None) -> None
         raise ConfigError(
             f"`mf_extra_kws` contains keys {', '.join(sorted(duplicates))} that are "
             "handled by dedicated config keys. Please remove them from `mf_extra_kws`."
+        )
+    spec = inspect.getfullargspec(mne.chpi.compute_head_pos)
+    if config.mf_mc and config.mf_mc_weighted and "weighted" not in spec.kwonlyargs:
+        raise ConfigError(
+            "mf_mc_weighted is set to True, but your version of MNE-Python does not "
+            "support the `weighted` argument in mne.chpi.compute_head_pos. Please "
+            "update MNE-Python to >= 1.13"
         )
     # if `destination="twa"` make sure `mf_mc=True`
     if (
@@ -346,8 +405,8 @@ def _check_config(config: SimpleNamespace, config_path: PathLike | None) -> None
         for sub, sessions in subjects_sessions.items():
             for ses in sessions:
                 if (
-                    config.ssp_ecg_channel.get(f"sub-{sub}") is None
-                    and config.ssp_ecg_channel.get(f"sub-{sub}_ses-{ses}") is None
+                    f"sub-{sub}" not in config.ssp_ecg_channel
+                    and f"sub-{sub}_ses-{ses}" not in config.ssp_ecg_channel
                 ):
                     missing.append(
                         f"sub-{sub}" if ses is None else f"sub-{sub}_ses-{ses}"
@@ -454,21 +513,28 @@ def _check_config(config: SimpleNamespace, config_path: PathLike | None) -> None
             "update MNE-BIDS (or if on the latest version, install the dev version)."
         )
 
-    bl = config.baseline
-    if bl is not None:
-        if (bl[0] is not None and bl[0] < config.epochs_tmin) or (
-            bl[1] is not None and bl[1] > config.epochs_tmax
-        ):
-            raise ValueError(
-                f"baseline {bl} outside of epochs interval "
-                f"{[config.epochs_tmin, config.epochs_tmax]}."
-            )
+    for task in tasks:
+        bl = _get_task_baseline(baseline=config.baseline, task=task)
+        tmin = _get_task_float(config.epochs_tmin, task=task)
+        tmax = _get_task_float(config.epochs_tmax, task=task)
+        if bl is not None:
+            if (bl[0] is not None and bl[0] < tmin) or (
+                bl[1] is not None and bl[1] > tmax
+            ):
+                raise ValueError(
+                    f"baseline {bl} for task {task} outside of epochs interval "
+                    f"{[tmin, tmax]}."
+                )
 
-        if bl[0] is not None and bl[1] is not None and bl[0] >= bl[1]:
-            raise ValueError(
-                f"The end of the baseline period must occur after its start, "
-                f"but you set baseline={bl}"
-            )
+            if bl[0] is not None and bl[1] is not None and bl[0] >= bl[1]:
+                raise ValueError(
+                    f"The end of the baseline period must occur after its start, "
+                    f"but you set baseline={bl} for task {task}"
+                )
+        del task, bl, tmin, tmax
+
+    # Contrasts
+    _validate_contrasts(config.contrasts, tasks=config.task)
 
     # check cluster permutation parameters
     if config.cluster_n_permutations < 10 / config.cluster_permutation_p_threshold:
@@ -478,6 +544,12 @@ def _check_config(config: SimpleNamespace, config_path: PathLike | None) -> None
         )
 
     # Another check that depends on some of the functions defined above
+    if config.task_is_rest and config.rest_epochs_duration is None:
+        raise ValueError(
+            "Please set `rest_epochs_duration` in your configuration when "
+            "`task_is_rest` is True."
+        )
+
     if not config.task_is_rest and config.conditions is None:
         raise ValueError(
             "Please indicate the name of your conditions in your "
@@ -541,6 +613,7 @@ def _default_factory(key: str, val: Any) -> Any:
             "channel noise": 0.3,
             "other": 0.3,
         },  # ica_class_thresholds
+        {"raster": "webp", "vector": "svg"},  # report_image_format
     ]
 
     def default_factory() -> Any:
@@ -619,6 +692,9 @@ _REMOVED_NAMES: dict[str, dict[str, str | None]] = {
     ),
 }
 
+# False alarms
+_IGNORED_SIMILAR_NAMES = {"BaselineTypeT"}
+
 
 def _check_misspellings_removals(
     *,
@@ -632,12 +708,18 @@ def _check_misspellings_removals(
         if user_name not in valid_names:
             # find the closest match
             closest_match = difflib.get_close_matches(user_name, valid_names, n=1)
+            other = closest_match[0] if closest_match else None
             msg = f"Found a variable named {repr(user_name)} in your custom config,"
-            if closest_match and closest_match[0] not in user_names:
+            if (
+                closest_match
+                and other not in user_names
+                and user_name not in _IGNORED_SIMILAR_NAMES
+            ):
                 this_msg = (
                     f"{msg} did you mean {repr(closest_match[0])}? "
                     "If so, please correct the error. If not, please rename "
                     "the variable to reduce ambiguity and avoid this message, "
+                    "prefix the variable name with an underscore (_), "
                     "or set config.config_validation to 'warn' or 'ignore'."
                 )
                 _handle_config_error(this_msg, config_validation)

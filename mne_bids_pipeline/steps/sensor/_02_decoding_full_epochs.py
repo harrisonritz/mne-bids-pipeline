@@ -25,16 +25,21 @@ from sklearn.preprocessing import StandardScaler
 from mne_bids_pipeline._config_utils import (
     _bids_kwargs,
     _get_decoding_proc,
-    _get_ss,
+    _get_sst,
+    _get_task_conditions_dict,
+    _get_task_decoding_contrasts,
     _restrict_analyze_channels,
-    get_decoding_contrasts,
     get_eeg_reference,
 )
-from mne_bids_pipeline._decoding import _decoding_preproc_steps
+from mne_bids_pipeline._decoding import (
+    _decoding_preproc_steps,
+    _get_nan_decoding_scores_if_insufficient,
+)
 from mne_bids_pipeline._logging import gen_log_kwargs, logger
 from mne_bids_pipeline._parallel import get_parallel_backend, parallel_func
 from mne_bids_pipeline._report import (
     _contrasts_to_names,
+    _get_prefix_tags,
     _open_report,
     _plot_full_epochs_decoding_scores,
     _sanitize_cond_tag,
@@ -55,6 +60,7 @@ def get_input_fnames_epochs_decoding(
     cfg: SimpleNamespace,
     subject: str,
     session: str | None,
+    task: str | None,
     condition1: str,
     condition2: str,
 ) -> InFilesT:
@@ -62,7 +68,7 @@ def get_input_fnames_epochs_decoding(
     fname_epochs = BIDSPath(
         subject=subject,
         session=session,
-        task=cfg.task,
+        task=task,
         acquisition=cfg.acq,
         run=None,
         recording=cfg.rec,
@@ -89,25 +95,28 @@ def run_epochs_decoding(
     exec_params: SimpleNamespace,
     subject: str,
     session: str | None,
+    task: str | None,
     condition1: str,
     condition2: str,
     in_files: InFilesT,
 ) -> OutFilesT:
     import matplotlib.pyplot as plt
 
-    msg = f"Contrasting conditions: {condition1} – {condition2}"
+    contrast_msg = f"{condition1} – {condition2}"
+    msg = f"Contrasting conditions: {contrast_msg}"
     logger.info(**gen_log_kwargs(message=msg))
     out_files = dict()
     bids_path = in_files["epochs"].copy().update(split=None)
 
-    epochs = mne.read_epochs(in_files.pop("epochs"))
+    epochs = mne.read_epochs(in_files.pop("epochs").fpath)
     _restrict_analyze_channels(epochs, cfg)
 
     # We define the epochs and the labels
-    if isinstance(cfg.conditions, dict):
+    assert isinstance(cfg.conditions, dict)
+    if condition1 in cfg.conditions:
         epochs_conds = [cfg.conditions[condition1], cfg.conditions[condition2]]
         cond_names = [condition1, condition2]
-    else:
+    else:  # could be a metadata query
         epochs_conds = cond_names = [condition1, condition2]
         epochs_conds = [condition1, condition2]
 
@@ -140,63 +149,89 @@ def run_epochs_decoding(
     )
     epochs.pick(pick_idx)
     print("channels: ", epochs.ch_names)
-    _decoding_preproc_steps(
-        cfg=cfg,
-        subject=subject,
-        session=session,
-        epochs=epochs,
-    )
-
     n_cond1 = len(epochs[epochs_conds[0]])
     n_cond2 = len(epochs[epochs_conds[1]])
 
-    X = epochs.get_data()
-    y = np.r_[np.ones(n_cond1), np.zeros(n_cond2)]
-
-    # clf = make_pipeline(
-    #     *pre_steps,
-    #     Vectorizer(),
-    #     LogReg(random_state=cfg.random_state),
-    # )
-    clf = make_pipeline(
-        StandardScaler(),
-        LogisticRegression(solver="liblinear"),
+    scores = _get_nan_decoding_scores_if_insufficient(
+        n_cond1=n_cond1,
+        n_cond2=n_cond2,
+        n_splits=cfg.decoding_n_splits,
+        score_shape=(),
+        contrast_msg=contrast_msg,
     )
+    patterns = filters = None  # only available when a classifier was actually fit
+    if scores is None:
+        _decoding_preproc_steps(
+            cfg=cfg,
+            subject=subject,
+            session=session,
+            task=task,
+            epochs=epochs,
+        )
+        X = epochs.get_data()
+        y = np.r_[np.ones(n_cond1), np.zeros(n_cond2)]
 
-    # Now, actually run the classification, and evaluate it via a
-    # cross-validation procedure.
-    if cfg.decoding_LOGO:
-        # number of unique groups
-        print(
-            f"Unique groups for LOGO: \
-                {epochs.metadata[cfg.decoding_LOGO_group].unique()}"
-        )
-        scores = cross_val_score(
-            estimator=clf,
-            X=X,
-            y=y,
-            cv=LeaveOneGroupOut(),
-            groups=epochs.metadata[cfg.decoding_LOGO_group].values,
-            scoring="roc_auc",
-            n_jobs=N_JOBS,
-            error_score="raise",
+        # clf = make_pipeline(
+        #     *pre_steps,
+        #     Vectorizer(),
+        #     LogReg(random_state=cfg.random_state),
+        # )
+        clf = make_pipeline(
+            StandardScaler(),
+            LogisticRegression(solver="liblinear"),
         )
 
-    else:
-        cv = StratifiedKFold(
-            shuffle=True,
-            random_state=cfg.random_state,
-            n_splits=cfg.decoding_n_splits,
+        # Now, actually run the classification, and evaluate it via a
+        # cross-validation procedure.
+        if cfg.decoding_LOGO:
+            # number of unique groups
+            print(
+                f"Unique groups for LOGO: \
+                    {epochs.metadata[cfg.decoding_LOGO_group].unique()}"
+            )
+            scores = cross_val_score(
+                estimator=clf,
+                X=X,
+                y=y,
+                cv=LeaveOneGroupOut(),
+                groups=epochs.metadata[cfg.decoding_LOGO_group].values,
+                scoring="roc_auc",
+                n_jobs=N_JOBS,
+                error_score="raise",
+            )
+
+        else:
+            cv = StratifiedKFold(
+                shuffle=True,
+                random_state=cfg.random_state,
+                n_splits=cfg.decoding_n_splits,
+            )
+            scores = cross_val_score(
+                estimator=clf,
+                X=X,
+                y=y,
+                cv=cv,
+                scoring="roc_auc",
+                n_jobs=N_JOBS,
+                error_score="raise",
+            )
+
+        # Fit once on all data to get patterns/filters in channel space.
+        # clf = make_pipeline(
+        #     *pre_steps,
+        #     Vectorizer(),
+        #     LinearModel(LogReg(random_state=cfg.random_state)),
+        # )
+        clf = make_pipeline(
+            StandardScaler(),
+            LinearModel(LogisticRegression(solver="liblinear")),
         )
-        scores = cross_val_score(
-            estimator=clf,
-            X=X,
-            y=y,
-            cv=cv,
-            scoring="roc_auc",
-            n_jobs=N_JOBS,
-            error_score="raise",
-        )
+        clf.fit(X, y)
+        n_ch, n_times = X.shape[1], X.shape[2]
+        patterns = get_coef(clf, attr="patterns_", inverse_transform=True)
+        filters = get_coef(clf, attr="filters_", inverse_transform=True)
+        patterns = patterns.reshape(n_ch, n_times)
+        filters = filters.reshape(n_ch, n_times)
 
     # Save the scores
     a_vs_b = f"{cond_names[0]}+{cond_names[1]}".replace(op.sep, "")
@@ -209,62 +244,56 @@ def run_epochs_decoding(
     )
     out_files[tsv_key] = out_files[mat_key].copy().update(extension=".tsv")
     savemat(out_files[f"mat_{processing}"], {"scores": scores})
+    mean_crossval_score = scores.mean()
+    if np.isnan(scores).all():
+        msg = f"Mean score for {contrast_msg} is unavailable."
+    else:
+        msg = (
+            f"Mean score for {contrast_msg}: "
+            f"{cfg.decoding_metric}={mean_crossval_score:0.3f}"
+        )
+    logger.info(**gen_log_kwargs(message=msg))
 
     tabular_data = pd.Series(
         {
-            "cond_1": cond_names[0],
-            "cond_2": cond_names[1],
-            "mean_crossval_score": scores.mean(axis=0),
+            "cond_1": condition1,
+            "cond_2": condition2,
+            "mean_crossval_score": mean_crossval_score,
             "metric": cfg.decoding_metric,
         }
     )
     tabular_data = pd.DataFrame(tabular_data).T
     tabular_data.to_csv(out_files[tsv_key], sep="\t", index=False)
 
-    # Fit once on all data to get patterns/filters in channel space.
-    # clf = make_pipeline(
-    #     *pre_steps,
-    #     Vectorizer(),
-    #     LinearModel(LogReg(random_state=cfg.random_state)),
-    # )
-    clf = make_pipeline(
-        StandardScaler(),
-        LinearModel(LogisticRegression(solver="liblinear")),
-    )
-    clf.fit(X, y)
-    n_ch, n_times = X.shape[1], X.shape[2]
-    patterns = get_coef(clf, attr="patterns_", inverse_transform=True)
-    filters = get_coef(clf, attr="filters_", inverse_transform=True)
-    patterns = patterns.reshape(n_ch, n_times)
-    filters = filters.reshape(n_ch, n_times)
-
-    weights_processing = f"{processing}+weights"
-    weights_processing = weights_processing.replace("_", "-").replace("-", "")
-    weights_key = f"tsv_weights_{weights_processing}"
-    out_files[weights_key] = bids_path.copy().update(
-        suffix="decoding", processing=weights_processing, extension=".tsv"
-    )
-
-    weights_frames = []
-    for kind, coef in ("patterns", patterns), ("filters", filters):
-        df = pd.DataFrame(coef, index=epochs.ch_names, columns=epochs.times)
-        df.index.name = "ch_name"
-        df = df.reset_index().melt(
-            id_vars="ch_name",
-            var_name="time",
-            value_name="value",
+    if patterns is not None and filters is not None:
+        weights_processing = f"{processing}+weights"
+        weights_processing = weights_processing.replace("_", "-").replace("-", "")
+        weights_key = f"tsv_weights_{weights_processing}"
+        out_files[weights_key] = bids_path.copy().update(
+            suffix="decoding", processing=weights_processing, extension=".tsv"
         )
-        df.insert(0, "kind", kind)
-        weights_frames.append(df)
-    weights_df = pd.concat(weights_frames, ignore_index=True)
-    weights_df.to_csv(out_files[weights_key], sep="\t", index=False)
+
+        weights_frames = []
+        for kind, coef in ("patterns", patterns), ("filters", filters):
+            df = pd.DataFrame(coef, index=epochs.ch_names, columns=epochs.times)
+            df.index.name = "ch_name"
+            df = df.reset_index().melt(
+                id_vars="ch_name",
+                var_name="time",
+                value_name="value",
+            )
+            df.insert(0, "kind", kind)
+            weights_frames.append(df)
+        weights_df = pd.concat(weights_frames, ignore_index=True)
+        weights_df.to_csv(out_files[weights_key], sep="\t", index=False)
 
     # Report
     with _open_report(
-        cfg=cfg, exec_params=exec_params, subject=subject, session=session
+        cfg=cfg, exec_params=exec_params, subject=subject, session=session, task=task
     ) as report:
         msg = "Adding full-epochs decoding results to the report."
         logger.info(**gen_log_kwargs(message=msg))
+        prefix, extra_tags = _get_prefix_tags(cfg=cfg, task=task)
 
         all_decoding_scores = []
         all_contrasts = []
@@ -288,60 +317,59 @@ def run_epochs_decoding(
             scores=all_decoding_scores,
             metric=cfg.decoding_metric,
         )
+        tags = ("epochs", "contrast", "decoding") + extra_tags
+        tags += tuple(
+            f"{_sanitize_cond_tag(cond_1)}–{_sanitize_cond_tag(cond_2)}"
+            for cond_1, cond_2 in cfg.contrasts
+        )
         report.add_figure(
             fig=fig,
-            title="Full-epochs decoding",
+            title=f"Full-epochs decoding{prefix}",
             caption=caption,
             section="Decoding: full-epochs",
-            tags=(
-                "epochs",
-                "contrast",
-                "decoding",
-                *[
-                    f"{_sanitize_cond_tag(cond_1)}–{_sanitize_cond_tag(cond_2)}"
-                    for cond_1, cond_2 in cfg.contrasts
-                ],
-            ),
+            tags=tags,
             replace=True,
         )
         # close figure to save memory
         plt.close(fig)
 
-        for ch_type in ("mag", "grad", "eeg"):
-            picks = mne.pick_types(
-                epochs.info,
-                meg=ch_type if ch_type in ("mag", "grad") else False,
-                eeg=ch_type == "eeg",
-                exclude=(),
-            )
-            if len(picks) == 0:
-                continue
-            info = mne.pick_info(epochs.info, picks)
-            for kind, coef in ("patterns", patterns), ("filters", filters):
-                evoked = mne.EvokedArray(coef[picks], info, tmin=epochs.tmin)
-                fig = evoked.plot_topomap(times="auto", show=False, ch_type=ch_type)
-                report.add_figure(
-                    fig=fig,
-                    title=f"Full-epochs {kind} ({ch_type})",
-                    caption=(
-                        "Topographic maps for full-epochs decoding, derived from "
-                        "channel-space coefficients."
-                    ),
-                    section="Decoding: full-epochs",
-                    tags=(
-                        "epochs",
-                        "contrast",
-                        "decoding",
-                        kind,
-                        ch_type,
-                        *[
-                            f"{_sanitize_cond_tag(cond_1)}–{_sanitize_cond_tag(cond_2)}"
-                            for cond_1, cond_2 in cfg.contrasts
-                        ],
-                    ),
-                    replace=True,
+        if patterns is not None and filters is not None:
+            for ch_type in ("mag", "grad", "eeg"):
+                picks = mne.pick_types(
+                    epochs.info,
+                    meg=ch_type if ch_type in ("mag", "grad") else False,
+                    eeg=ch_type == "eeg",
+                    exclude=(),
                 )
-                plt.close(fig)
+                if len(picks) == 0:
+                    continue
+                info = mne.pick_info(epochs.info, picks)
+                for kind, coef in ("patterns", patterns), ("filters", filters):
+                    evoked = mne.EvokedArray(coef[picks], info, tmin=epochs.tmin)
+                    fig = evoked.plot_topomap(times="auto", show=False, ch_type=ch_type)
+                    report.add_figure(
+                        fig=fig,
+                        title=f"Full-epochs {kind} ({ch_type}){prefix}",
+                        caption=(
+                            "Topographic maps for full-epochs decoding, derived from "
+                            "channel-space coefficients."
+                        ),
+                        section="Decoding: full-epochs",
+                        tags=(
+                            "epochs",
+                            "contrast",
+                            "decoding",
+                            kind,
+                            ch_type,
+                            *extra_tags,
+                            *[
+                                f"{_sanitize_cond_tag(cond_1)}–{_sanitize_cond_tag(cond_2)}"
+                                for cond_1, cond_2 in cfg.contrasts
+                            ],
+                        ),
+                        replace=True,
+                    )
+                    plt.close(fig)
 
     assert len(in_files) == 0, in_files.keys()
     return _prep_out_files(exec_params=exec_params, out_files=out_files)
@@ -350,12 +378,12 @@ def run_epochs_decoding(
 def get_config(
     *,
     config: SimpleNamespace,
+    task: str | None,
 ) -> SimpleNamespace:
     cfg = SimpleNamespace(
-        conditions=config.conditions,
-        contrasts=get_decoding_contrasts(config),
+        conditions=_get_task_conditions_dict(conditions=config.conditions, task=task),
+        contrasts=_get_task_decoding_contrasts(config, task=task),
         cov_rank=config.cov_rank,
-        decode=config.decode,
         decoding_which_epochs=config.decoding_which_epochs,
         decoding_metric=config.decoding_metric,
         decoding_epochs_tmin=config.decoding_epochs_tmin,
@@ -385,25 +413,27 @@ def main(*, config: SimpleNamespace) -> None:
         logger.info(**gen_log_kwargs(message="SKIP"))
         return
 
-    ss = _get_ss(config=config)
-    sscc = [
-        (subject, session, cond_1, cond_2)
-        for subject, session in ss
-        for cond_1, cond_2 in get_decoding_contrasts(config)
+    sst = _get_sst(config=config)
+    sstcc = [
+        (subject, session, task, cond_1, cond_2)
+        for subject, session, task in sst
+        for cond_1, cond_2 in _get_task_decoding_contrasts(config, task=task)
     ]
+    del sst
     with get_parallel_backend(config.exec_params):
         parallel, run_func = parallel_func(
-            run_epochs_decoding, exec_params=config.exec_params, n_iter=len(sscc)
+            run_epochs_decoding, exec_params=config.exec_params, n_iter=len(sstcc)
         )
         logs = parallel(
             run_func(
-                cfg=get_config(config=config),
+                cfg=get_config(config=config, task=task),
                 exec_params=config.exec_params,
                 subject=subject,
                 condition1=cond_1,
                 condition2=cond_2,
                 session=session,
+                task=task,
             )
-            for subject, session, cond_1, cond_2 in sscc
+            for subject, session, task, cond_1, cond_2 in sstcc
         )
     save_logs(config=config, logs=logs)

@@ -9,10 +9,13 @@ from mne import Covariance
 from mne_bids import BIDSPath
 
 from mne_bids_pipeline.typing import (
-    ArbitraryContrast,
+    BaselineTypeT,
+    ConditionsTypeT,
+    ContrastSequenceT,
     DigMontageType,
     FloatArrayLike,
     PathLike,
+    RunsTypeT,
     UniqueSequence,
 )
 
@@ -87,9 +90,9 @@ Whether to continue processing the dataset if some combinations of `subjects` an
 `sessions` are missing.
 """
 
-task: str = ""
+task: str | Sequence[str] = ""
 """
-The task to process.
+The task(s) to process.
 """
 
 task_is_rest: bool = False
@@ -97,10 +100,11 @@ task_is_rest: bool = False
 Whether the task should be treated as resting-state data.
 """
 
-runs: Sequence[str] | Literal["all"] = "all"
+runs: RunsTypeT | dict[str, RunsTypeT] = "all"
 """
 The runs to process. If `'all'`, will process all runs found in the
 BIDS dataset.
+Can be a dict mapping tasks to runs to process as well.
 """
 
 exclude_runs: dict[str, list[str]] | None = None
@@ -469,20 +473,16 @@ preprocessing stage itself, nor to the source analysis stage.
 reader_extra_params: dict[str, Any] = {}
 """
 Parameters to be passed to `read_raw_bids()` calls when importing raw data.
+If an empty dict (default) is provided and
+[`use_maxwell_filter=True`][mne_bids_pipeline._config.use_maxwell_filter] and
+the dataset uses FIF files, we will automatically set
+`reader_extra_params = dict(allow_maxshield="yes")`.
 
 ???+ example "Example"
     Enforce units for EDF files:
     ```python
     reader_extra_params = {"units": "uV"}
     ```
-"""
-
-read_raw_bids_verbose: Literal["error"] | None = None
-"""
-Verbosity level to pass to `read_raw_bids(..., verbose=read_raw_bids_verbose)`.
-If you know your dataset will contain files that are not perfectly BIDS
-compliant (e.g., "Did not find any meg.json..."), you can set this to
-`'error'` to suppress warnings emitted by read_raw_bids.
 """
 
 plot_psd_for_runs: Literal["all"] | Sequence[str] = "all"
@@ -761,12 +761,20 @@ mf_reference_run: str | None = None
 """
 Which run to take as the reference for adjusting the head position of all
 runs when [`mf_destination="reference_run"`][mne_bids_pipeline._config.mf_destination].
-If `None`, pick the first run.
+If `None`, pick the first run for the
+[`mf_reference_task`][mne_bids_pipeline._config.mf_reference_task].
 
 ???+ example "Example"
     ```python
     mf_reference_run = '01'  # Use run "01"
     ```
+"""
+
+mf_reference_task: str | None = None
+"""
+Which task to take as the reference for adjusting the head position of all
+runs when [`mf_destination="reference_run"`][mne_bids_pipeline._config.mf_destination].
+If `None`, pick the first task found in the BIDS dataset.
 """
 
 mf_cal_fname: str | None = None
@@ -846,6 +854,12 @@ Minimum goodness of fit to accept for each cHPI coil.
 mf_mc_dist_limit: float = 0.005
 """
 Minimum distance (m) to accept for cHPI position fitting.
+"""
+
+mf_mc_weighted: bool = True
+"""
+Whether to use smooth weighting for HPI during movement compensation.
+Using `True` (default) requires MNE >= 1.13.
 """
 
 mf_mc_rotation_velocity_limit: float | None = None
@@ -1156,7 +1170,7 @@ unknown metadata column, a warning will be emitted and all epochs will be kept.
     ```
 """
 
-conditions: Sequence[str] | dict[str, str] | None = None
+conditions: ConditionsTypeT | dict[str, ConditionsTypeT] | None = None
 """
 The time-locked events based on which to create evoked responses.
 This can either be name of the experimental condition as specified in the
@@ -1167,6 +1181,10 @@ for more information.
 
 Passing a dictionary allows to assign a name to map a complex condition name
 (value) to a more legible one (value).
+
+Passing a dictionary whose values are dictionaries or sequences themselves allows to
+specify conditions per task (first has ``task`` keys, second level has desired
+condition name keys).
 
 This is a **required** parameter in the configuration file, unless you are
 processing resting-state data. If left as `None` and
@@ -1188,11 +1206,19 @@ error.
     conditions = {'simple_name': 'complex/condition/with_subconditions'}
     conditions = {'correct': 'response/correct',
                   'incorrect': 'response/incorrect'}
+    Pass a per-task dictionary:
+    ```python
+    conditions = {
+        "localizer": ['stimulus/left', 'stimulus/right'],
+        "main_task": ['target/left', 'target/right']
+    }
+    ```
 """
 
-epochs_tmin: float = -0.2
+epochs_tmin: float | dict[str, float] = -0.2
 """
 The beginning of an epoch, relative to the respective event, in seconds.
+Can be a dict mapping task names to tmin values.
 
 ???+ example "Example"
     ```python
@@ -1200,9 +1226,11 @@ The beginning of an epoch, relative to the respective event, in seconds.
     ```
 """
 
-epochs_tmax: float = 0.5
+epochs_tmax: float | dict[str, float] = 0.5
 """
 The end of an epoch, relative to the respective event, in seconds.
+Can be a dict mapping task names to tmax values.
+
 ???+ example "Example"
     ```python
     epochs_tmax = 0.5  # 500 ms after event onset
@@ -1211,7 +1239,10 @@ The end of an epoch, relative to the respective event, in seconds.
 
 rest_epochs_duration: float | None = None
 """
-Duration of epochs in seconds.
+Duration of fixed-length epochs, in seconds. This parameter must be set when
+[`task_is_rest`][mne_bids_pipeline._config.task_is_rest] is `True`. Use
+[`rest_epochs_overlap`][mne_bids_pipeline._config.rest_epochs_overlap] to control
+the overlap between consecutive epochs.
 """
 
 rest_epochs_overlap: float | None = None
@@ -1220,10 +1251,11 @@ Overlap between epochs in seconds. This is used if the task is `'rest'`
 and when the annotations do not contain any stimulation or behavior events.
 """
 
-baseline: tuple[float | None, float | None] | None = (None, 0)
+baseline: BaselineTypeT | dict[str, BaselineTypeT] = (None, 0)
 """
 Specifies which time interval to use for baseline correction of epochs;
 if `None`, no baseline correction is applied.
+Can be a dict mapping task names to baseline values.
 
 ???+ example "Example"
     ```python
@@ -1407,7 +1439,7 @@ otherwise, SSP won't be able to "see" these artifacts.
     ```
 """
 
-ssp_ecg_channel: str | dict[str, str] | None = None
+ssp_ecg_channel: str | dict[str, str | None] | None = None
 """
 Channel to use for ECG SSP. Can be useful when the autodetected ECG channel
 is not reliable. If `str`, the same channel will be used for all subjects.
@@ -1774,20 +1806,20 @@ exceeds this value, the channels won't be interpolated and the epoch will be dro
 
 # ## Condition contrasts
 
-contrasts: Sequence[tuple[str, str] | ArbitraryContrast] = []
+contrasts: ContrastSequenceT | dict[str, ContrastSequenceT] = []
 """
 The conditions to contrast via a subtraction of ERPs / ERFs. The list elements
 can either be tuples or dictionaries (or a mix of both). Each element in the
-list corresponds to a single contrast.
+list corresponds to a single contrast. For each entry in the list:
 
-A tuple specifies a one-vs-one contrast, where the second condition is
-subtracted from the first.
+1. A tuple specifies a one-vs-one contrast, where the second condition is
+   subtracted from the first.
 
-If a dictionary, must contain the following keys:
+2. If a dictionary, must contain the following keys:
 
-- `name`: a custom name of the contrast
-- `conditions`: the conditions to contrast
-- `weights`: the weights associated with each condition.
+    - `name`: a custom name of the contrast
+    - `conditions`: the conditions to contrast
+    - `weights`: the weights associated with each condition.
 
 Pass an empty list to avoid calculation of any contrasts.
 
@@ -1898,7 +1930,6 @@ The number of folds (also called "splits") to use in the K-fold cross-validation
 scheme.
 """
 
-
 decoding_LOGO: bool = False
 """
 do leave-one-group-out (LOGO) cross-validation, where the "groups" are defined by the
@@ -1935,10 +1966,27 @@ that both conditions have the same number of epochs. This can help to prevent bi
 the decoding results due to imbalanced class sizes.
 """
 
+decoding_time: bool = True
+"""
+Whether to perform time-by-time decoding. `decode` must also be `True` for this
+to have any effect.
+
+!!! alert
+    Added in v1.10.0.
+"""
+
+decoding_time_decim: int = 1
+"""
+Says how much to decimate data before time-by-time based decoding.
+
+!!! alert
+    Added in v1.10.0.
+"""
 
 decoding_time_generalization: bool = False
 """
-Whether to perform time generalization.
+Whether to perform time generalization. `decode` and `decoding_time` must both be `True`
+for this to have any effect.
 
 Time generalization (also called "temporal generalization" or "generalization
 across time", GAT) is an extension of the time-by-time decoding approach.
@@ -1947,7 +1995,7 @@ testing the model on the same time point in the test data, it will be tested
 on **all** time points.
 
 !!! cite ""
-    [T]he manner in which the trained classifiers generalize across time, and
+    The manner in which the trained classifiers generalize across time, and
     from one experimental condition to another, sheds light on the temporal
     organization of information-processing stages.
 
@@ -1959,7 +2007,8 @@ procedure may take a significant amount of time.
 
 decoding_time_generalization_decim: int = 1
 """
-Says how much to decimate data before time generalization decoding.
+Says how much to decimate data before time generalization. The max of this value and
+`decoding_time_decim` will be used for time generalization computations.
 This is done in addition to the decimation done at the epochs level via the
 [`epochs_decim`][mne_bids_pipeline._config.epochs_decim] parameter. This can be
 used to greatly speed up time generalization at the cost of lower time
@@ -2538,6 +2587,13 @@ empty list, `[]`.
 
 # ## Report generation
 
+smoothing_steps: int | None = None
+"""
+Specifies the number of smoothing steps to use when morphing from individual subject
+data to the average subject. See the `smooth` parameter of `mne.compute_source_morph`
+for details.
+"""
+
 report_evoked_n_time_points: int | None = None
 """
 Specifies the number of time points to display for each evoked
@@ -2559,6 +2615,25 @@ in the report. If `None`, it defaults to the current default in MNE-Python.
     Only display 5 images per source estimate:
     ```python
     report_stc_n_time_points = 5
+    ```
+"""
+
+report_image_format: dict[
+    Literal["raster", "vector"], Literal["webp", "webp-lossy", "png", "svg"]
+] = dict(raster="webp", vector="svg")
+"""
+The formats used to store images embedded in the reports. The `"raster"` entry applies
+to inherently pixel-based content (topographic map sliders, ICA properties, epochs
+images, and similar) and can be `"webp"`, `"webp-lossy"`, or `"png"` — WebP produces the
+smallest reports, but lossless WebP is considerably slower to encode than PNG, which can
+make a difference on report-heavy runs; lossy WebP encodes about as fast as PNG and
+still yields much smaller reports. The `"vector"` entry applies to line-art figures and
+can additionally be `"svg"`. Missing keys keep their default values.
+
+???+ example "Example"
+    Trade larger reports for faster processing:
+    ```python
+    report_image_format = dict(raster="png")
     ```
 """
 
@@ -2678,21 +2753,86 @@ dask_worker_memory_limit: str = "10G"
 The maximum amount of RAM per Dask worker.
 """
 
+dask_worker_startup_timeout: float = 3600
+"""
+How long to wait (in seconds) for workers to come up before giving up, e.g. while
+[`dask_cluster`][mne_bids_pipeline._config.dask_cluster] jobs sit in the batch queue.
+Only used when `dask_cluster` is set.
+"""
+
+dask_cluster: str | Callable[[], Any] | None = None
+"""
+Attach to an external Dask cluster instead of starting workers locally, e.g., on an
+HPC system via [dask-jobqueue](https://jobqueue.dask.org). Either the address of a
+running scheduler (e.g., `"tcp://10.0.0.1:8786"`), or a callable that returns a
+[Dask cluster object](https://distributed.dask.org/en/stable/api.html#cluster) (or
+anything accepted by `distributed.Client`):
+
+```python
+def dask_cluster():
+    from dask_jobqueue import SLURMCluster
+
+    cluster = SLURMCluster(queue="cpu", cores=8, memory="32GB", walltime="02:00:00")
+    cluster.scale(jobs=4)  # or cluster.adapt(maximum_jobs=8)
+    return cluster
+```
+
+If the callable returns a cluster with no workers requested, the pipeline calls
+`cluster.scale(n_jobs)`. Compute nodes must share the filesystem holding
+[`bids_root`][mne_bids_pipeline._config.bids_root] and
+[`deriv_root`][mne_bids_pipeline._config.deriv_root] and have the same Python
+environment. Ignored if `parallel_backend` is not `'dask'`;
+[`dask_worker_memory_limit`][mne_bids_pipeline._config.dask_worker_memory_limit] and
+[`dask_temp_dir`][mne_bids_pipeline._config.dask_temp_dir] are then also ignored
+(configure these on the cluster instead).
+"""
+
 # %%
 # # Logging
 #
 # These options control how much logging output is produced.
 
-log_level: Literal["info", "error"] = "info"
+log_level: Literal["info", "warning", "error"] = "info"
 """
 Set the pipeline logging verbosity.
 """
 
-mne_log_level: Literal["info", "error"] = "error"
+mne_log_level: Literal["info", "warning", "error"] = "warning"
 """
 Set the MNE-Python logging verbosity.
 """
 
+read_raw_bids_verbose: Literal["info", "warning", "error"] | None = None
+"""
+Verbosity level to pass to `read_raw_bids(..., verbose=read_raw_bids_verbose)`.
+If you know your dataset will contain files that are not perfectly BIDS
+compliant (e.g., "Did not find any meg.json..."), you can set this to
+`'error'` to suppress warnings emitted by read_raw_bids.
+"""
+
+ignore_warnings: Sequence[str] = ()
+r"""
+A list of message strings to ignore during execution. This gives you
+finer-grained control over warnings to suppress during `read_raw_bids`,
+fitting sphere to headshape, etc. Each string is treated as a regular expression,
+and for convenience, they will be used with additional regex added at each end like:
+```
+warnings.ignorewarnings("ignore", message=rf"[\S\s]*{msg}[\S\s]*")
+```
+
+???+ example "Example"
+    Suppressing warnings for ds000117 can be done with:
+    ```python
+    ignore_warnings = (
+        "The number of channels in the channels.tsv sidecar file",
+        'contains a "stim_type" column. This column should be renamed to "trial_type"',
+        "Cannot set channel type for the following channels",
+        "Unable to map the following column",
+        "more than 20 mm from head frame origin",
+        "Did not find any (channels.tsv|meg.json) associated with sub-emptyroom_ses",
+    )
+    ```
+"""
 
 # %%
 # # Error handling

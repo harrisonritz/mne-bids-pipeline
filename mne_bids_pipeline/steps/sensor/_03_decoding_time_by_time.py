@@ -32,19 +32,23 @@ from sklearn.preprocessing import StandardScaler
 from mne_bids_pipeline._config_utils import (
     _bids_kwargs,
     _get_decoding_proc,
+    _get_sst,
+    _get_task_conditions_dict,
+    _get_task_decoding_contrasts,
     _restrict_analyze_channels,
-    get_decoding_contrasts,
     get_eeg_reference,
-    get_subjects_sessions,
 )
-from mne_bids_pipeline._decoding import _decoding_preproc_steps
+from mne_bids_pipeline._decoding import (
+    _decoding_preproc_steps,
+    _get_nan_decoding_scores_if_insufficient,
+)
 from mne_bids_pipeline._logging import gen_log_kwargs, logger
 from mne_bids_pipeline._parallel import get_parallel_backend, get_parallel_backend_name
 from mne_bids_pipeline._report import (
+    _get_prefix_tags,
     _open_report,
     _plot_decoding_time_generalization,
     _plot_time_by_time_decoding_scores,
-    _sanitize_cond_tag,
 )
 from mne_bids_pipeline._run import (
     _prep_out_files,
@@ -62,6 +66,7 @@ def get_input_fnames_time_decoding(
     cfg: SimpleNamespace,
     subject: str,
     session: str | None,
+    task: str | None,
     condition1: str,
     condition2: str,
 ) -> InFilesT:
@@ -69,7 +74,7 @@ def get_input_fnames_time_decoding(
     fname_epochs = BIDSPath(
         subject=subject,
         session=session,
-        task=cfg.task,
+        task=task,
         acquisition=cfg.acq,
         run=None,
         recording=cfg.rec,
@@ -96,6 +101,7 @@ def run_time_decoding(
     exec_params: SimpleNamespace,
     subject: str,
     session: str | None,
+    task: str | None,
     condition1: str,
     condition2: str,
     in_files: InFilesT,
@@ -106,21 +112,24 @@ def run_time_decoding(
         kind = "time generalization"
     else:
         kind = "sliding estimator"
-    msg = f"Contrasting conditions ({kind}): {condition1} – {condition2}"
+    contrast_msg = f"{condition1} – {condition2}"
+    msg = f"Contrasting conditions ({kind}): {contrast_msg}"
     logger.info(**gen_log_kwargs(message=msg))
     out_files = dict()
     bids_path = in_files["epochs"].copy().update(split=None)
 
-    epochs = mne.read_epochs(in_files.pop("epochs"))
+    epochs = mne.read_epochs(in_files.pop("epochs").fpath)
     _restrict_analyze_channels(epochs, cfg)
 
     # We define the epochs and the labels
-    if isinstance(cfg.conditions, dict):
+    assert isinstance(cfg.conditions, dict)
+    if condition1 in cfg.conditions:
         epochs_conds = [cfg.conditions[condition1], cfg.conditions[condition2]]
         cond_names = [condition1, condition2]
-    else:
+    else:  # could be a metadata query
         epochs_conds = cond_names = [condition1, condition2]
         epochs_conds = [condition1, condition2]
+    del condition1, condition2
     epoch_counts = dict()
     for contrast in cfg.contrasts:
         for cond in contrast:
@@ -139,7 +148,8 @@ def run_time_decoding(
         del epochs1, epochs2
     else:
         epochs = mne.concatenate_epochs(
-            [epochs[epochs_conds[0]], epochs[epochs_conds[1]]], verbose="error"
+            [epochs[epochs_conds[0]], epochs[epochs_conds[1]]],
+            verbose="error",
         )
     n_cond1 = len(epochs[epochs_conds[0]])
     n_cond2 = len(epochs[epochs_conds[1]])
@@ -153,81 +163,90 @@ def run_time_decoding(
         print(f"Applying baseline correction for decoding: {cfg.decoding_baseline}")
         epochs.apply_baseline(cfg.decoding_baseline)
 
-    # We can't use the full rank here because the number of samples can just be the
-    # number of epochs (which can be fewer than the number of channels)
-    _decoding_preproc_steps(
-        cfg=cfg,
-        subject=subject,
-        session=session,
-        epochs=epochs,
-        pca=False,
-    )
-    # At some point we might want to enable this, but it's really slow and arguably
-    # unnecessary so let's omit it for now:
-    # pre_steps.append(
-    #     mne.decoding.UnsupervisedSpatialFilter(
-    #         PCA(n_components=0.999, whiten=True),
-    #     )
-    # )
-
-    decim = cfg.decoding_time_generalization_decim
-    if cfg.decoding_time_generalization and decim > 1:
+    decim = cfg.decoding_time_decim
+    if cfg.decoding_time_generalization:
+        decim = max(cfg.decoding_time_generalization_decim, decim)
+    if decim > 1:
         epochs.decimate(decim, verbose="error")
 
-    X = epochs.get_data()
-    y = np.r_[np.ones(n_cond1), np.zeros(n_cond2)]
+    score_shape = (len(epochs.times),)
+    if cfg.decoding_time_generalization:
+        score_shape += (len(epochs.times),)
+    scores = _get_nan_decoding_scores_if_insufficient(
+        n_cond1=n_cond1,
+        n_cond2=n_cond2,
+        n_splits=cfg.decoding_n_splits,
+        score_shape=score_shape,
+        contrast_msg=contrast_msg,
+    )
+
     # ProgressBar does not work on dask, so only enable it if not using dask
     verbose = get_parallel_backend_name(exec_params=exec_params) != "dask"
     with get_parallel_backend(exec_params):
-        # clf = make_pipeline(
-        #     *pre_steps,
-        #     Vectorizer(),
-        #     LogReg(random_state=cfg.random_state),
-        # )
-        clf = make_pipeline(
-            StandardScaler(),
-            LogisticRegression(solver="liblinear"),
-        )
-        if cfg.decoding_time_generalization:
-            estimator = GeneralizingEstimator(
-                clf,
-                scoring=cfg.decoding_metric,
-                n_jobs=exec_params.n_jobs,
+        if scores is None:
+            # We can't use the full rank here because the number of samples can
+            # just be the number of epochs (which can be fewer than the number
+            # of channels).
+            _decoding_preproc_steps(
+                cfg=cfg,
+                subject=subject,
+                session=session,
+                task=task,
+                epochs=epochs,
+                pca=False,
             )
-            cv_scoring_n_jobs = 1
-        else:
-            estimator = SlidingEstimator(
-                clf,
-                scoring=cfg.decoding_metric,
-                n_jobs=N_JOBS,
-            )
-            cv_scoring_n_jobs = exec_params.n_jobs
-
-        if cfg.decoding_LOGO:
-            scores = cross_val_multiscore(
-                estimator,
-                X=X,
-                y=y,
-                cv=LeaveOneGroupOut(),
-                groups=epochs.metadata[cfg.decoding_LOGO_group].values,
-                n_jobs=cv_scoring_n_jobs,
-                verbose=False,  # ensure ProgressBar is shown (can be slow)
+            # clf = make_pipeline(
+            #     *pre_steps,
+            #     Vectorizer(),
+            #     LogReg(random_state=cfg.random_state),
+            # )
+            clf = make_pipeline(
+                StandardScaler(),
+                LogisticRegression(solver="liblinear"),
             )
 
-        else:
-            cv = StratifiedKFold(
-                shuffle=True,
-                random_state=cfg.random_state,
-                n_splits=cfg.decoding_n_splits,
-            )
-            scores = cross_val_multiscore(
-                estimator,
-                X=X,
-                y=y,
-                cv=cv,
-                n_jobs=cv_scoring_n_jobs,
-                verbose=verbose,  # ensure ProgressBar is shown (can be slow)
-            )
+            if cfg.decoding_time_generalization:
+                estimator = GeneralizingEstimator(
+                    clf,
+                    scoring=cfg.decoding_metric,
+                    n_jobs=exec_params.n_jobs,
+                )
+                cv_scoring_n_jobs = 1
+            else:
+                estimator = SlidingEstimator(
+                    clf,
+                    scoring=cfg.decoding_metric,
+                    n_jobs=N_JOBS,
+                )
+                cv_scoring_n_jobs = exec_params.n_jobs
+
+            X = epochs.get_data()
+            y = np.r_[np.ones(n_cond1), np.zeros(n_cond2)]
+            if cfg.decoding_LOGO:
+                scores = cross_val_multiscore(
+                    estimator,
+                    X=X,
+                    y=y,
+                    cv=LeaveOneGroupOut(),
+                    groups=epochs.metadata[cfg.decoding_LOGO_group].values,
+                    n_jobs=cv_scoring_n_jobs,
+                    verbose=False,  # ensure ProgressBar is shown (can be slow)
+                )
+
+            else:
+                cv = StratifiedKFold(
+                    shuffle=True,
+                    random_state=cfg.random_state,
+                    n_splits=cfg.decoding_n_splits,
+                )
+                scores = cross_val_multiscore(
+                    estimator,
+                    X=X,
+                    y=y,
+                    cv=cv,
+                    n_jobs=cv_scoring_n_jobs,
+                    verbose=verbose,  # ensure ProgressBar is shown (can be slow)
+                )
 
         # let's save the scores now
         a_vs_b = f"{cond_names[0]}+{cond_names[1]}".replace(op.sep, "")
@@ -253,6 +272,15 @@ def run_time_decoding(
             mean_crossval_score = np.diag(scores.mean(axis=0))
         else:
             mean_crossval_score = scores.mean(axis=0)
+        if np.isnan(scores).all():
+            msg = f"Maximum score for {contrast_msg} is unavailable."
+        else:
+            max_idx = np.argmax(mean_crossval_score)
+            msg = (
+                f"Max score for {contrast_msg}: t={epochs.times[max_idx]:0.3f} sec, "
+                f"{cfg.decoding_metric}={mean_crossval_score[max_idx]:0.3f}"
+            )
+        logger.info(**gen_log_kwargs(message=msg))
 
         out_files[f"tsv_{processing}"] = (
             out_files[mat_key].copy().update(extension=".tsv")
@@ -270,21 +298,17 @@ def run_time_decoding(
 
     # Report
     with _open_report(
-        cfg=cfg, exec_params=exec_params, subject=subject, session=session
+        cfg=cfg, exec_params=exec_params, subject=subject, session=session, task=task
     ) as report:
         msg = "Adding time-by-time decoding results to the report."
         logger.info(**gen_log_kwargs(message=msg))
 
         section = "Decoding: time-by-time"
         for contrast in cfg.contrasts:
+            prefix, extra_tags = _get_prefix_tags(cfg=cfg, task=task, contrast=contrast)
             cond_1, cond_2 = contrast
             a_vs_b = f"{cond_1}+{cond_2}".replace(op.sep, "")
-            tags = (
-                "epochs",
-                "contrast",
-                "decoding",
-                f"{_sanitize_cond_tag(contrast[0])}–{_sanitize_cond_tag(contrast[1])}",
-            )
+            tags = ("epochs", "contrast", "decoding") + extra_tags
 
             processing = f"{a_vs_b}+TimeByTime+{cfg.decoding_metric}"
             processing = processing.replace("_", "-").replace("-", "")
@@ -308,7 +332,7 @@ def run_time_decoding(
                 f"{epoch_counts[cond_1]} × {cond_1} vs. "
                 f"{epoch_counts[cond_2]} × {cond_2}"
             )
-            title = f"Decoding over time: {cond_1} vs. {cond_2}"
+            title = f"Decoding over time{prefix}"
             report.add_figure(
                 fig=fig,
                 title=title,
@@ -350,15 +374,16 @@ def run_time_decoding(
 def get_config(
     *,
     config: SimpleNamespace,
+    task: str | None,
 ) -> SimpleNamespace:
     cfg = SimpleNamespace(
-        conditions=config.conditions,
-        contrasts=get_decoding_contrasts(config),
+        conditions=_get_task_conditions_dict(conditions=config.conditions, task=task),
+        contrasts=_get_task_decoding_contrasts(config, task=task),
         cov_rank=config.cov_rank,
-        decode=config.decode,
         decoding_which_epochs=config.decoding_which_epochs,
         decoding_metric=config.decoding_metric,
         decoding_n_splits=config.decoding_n_splits,
+        decoding_time_decim=config.decoding_time_decim,
         decoding_time_generalization=config.decoding_time_generalization,
         decoding_time_generalization_decim=config.decoding_time_generalization_decim,  # noqa: E501
         decoding_LOGO=config.decoding_LOGO,
@@ -385,21 +410,26 @@ def main(*, config: SimpleNamespace) -> None:
         logger.info(**gen_log_kwargs(message="SKIP"))
         return
 
+    if not config.decoding_time:
+        logger.info(**gen_log_kwargs(message="SKIP"))
+        return
+
     # Here we go parallel inside the :class:`mne.decoding.SlidingEstimator`
     # so we don't dispatch manually to multiple jobs.
     logs = [
         run_time_decoding(
             cfg=get_config(
                 config=config,
+                task=task,
             ),
             exec_params=config.exec_params,
             subject=subject,
+            session=session,
+            task=task,
             condition1=cond_1,
             condition2=cond_2,
-            session=session,
         )
-        for subject, sessions in get_subjects_sessions(config).items()
-        for session in sessions
-        for cond_1, cond_2 in get_decoding_contrasts(config)
+        for subject, session, task in _get_sst(config=config)
+        for cond_1, cond_2 in _get_task_decoding_contrasts(config, task=task)
     ]
     save_logs(config=config, logs=logs)

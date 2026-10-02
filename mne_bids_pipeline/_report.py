@@ -5,27 +5,52 @@ from functools import lru_cache
 from io import StringIO
 from textwrap import indent
 from types import SimpleNamespace
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
-import matplotlib.axes
-import matplotlib.figure
-import matplotlib.image
-import matplotlib.transforms
 import mne
 import numpy as np
-import pandas as pd
 from filelock import FileLock
-from mne.io import BaseRaw
-from mne.report.report import _df_bootstrap_table
 from mne.utils import _pl
 from mne_bids import BIDSPath
 from mne_bids.stats import count_events
-from scipy.io import loadmat
 
-from ._config_utils import get_all_contrasts
-from ._decoding import _handle_csp_args
+from ._config_utils import _get_task_contrasts
+from ._flow import _report_flow_html
+from ._io import _LOCK_TIMEOUT
 from ._logging import _linkfile, gen_log_kwargs, logger
 from .typing import FloatArrayT
+
+# This module is imported by every run (via steps/init), but matplotlib, pandas,
+# sklearn (._decoding) and mne.report.report only matter once a step actually adds
+# something to a report, so keep them out of module scope -- including out of the
+# annotations, which are evaluated eagerly
+if TYPE_CHECKING:
+    import matplotlib.axes
+    import matplotlib.figure
+    import matplotlib.image
+    import pandas as pd
+    from mne.io import BaseRaw
+
+
+def _report_path(
+    *, cfg: SimpleNamespace, subject: str, session: str | None = None
+) -> BIDSPath:
+    return BIDSPath(
+        subject=subject,
+        session=session,
+        # Report is across all runs and tasks, but for logging purposes it's helpful
+        # to pass the run and task for gen_log_kwargs
+        run=None,
+        task=None,
+        acquisition=cfg.acq,
+        recording=cfg.rec,
+        space=cfg.space,
+        extension=".h5",
+        datatype=cfg.datatype,
+        root=cfg.deriv_root,
+        suffix="report",
+        check=False,
+    )
 
 
 class _NullReport:
@@ -51,31 +76,16 @@ def _open_report(
     task: str | None = None,
     fname_report: BIDSPath | None = None,
     name: str = "report",
-) -> Generator[mne.Report, None, None]:
+) -> "Generator[mne.Report, None, None]":
     if not exec_params.generate_reports:
         yield _NullReport()  # type: ignore[misc]
         return
     if fname_report is None:
-        fname_report = BIDSPath(
-            subject=subject,
-            session=session,
-            # Report is across all runs, but for logging purposes it's helpful
-            # to pass the run and task for gen_log_kwargs
-            run=None,
-            task=cfg.task,
-            acquisition=cfg.acq,
-            recording=cfg.rec,
-            space=cfg.space,
-            extension=".h5",
-            datatype=cfg.datatype,
-            root=cfg.deriv_root,
-            suffix="report",
-            check=False,
-        )
+        fname_report = _report_path(cfg=cfg, subject=subject, session=session)
     fname_report = fname_report.fpath
     assert fname_report.suffix == ".h5", fname_report.suffix
     # prevent parallel file access
-    with FileLock(f"{fname_report}.lock"), _agg_backend():
+    with FileLock(f"{fname_report}.lock", timeout=_LOCK_TIMEOUT), _agg_backend():
         if not fname_report.is_file():
             msg = f"Initializing {name} HDF5 file"
             logger.info(**gen_log_kwargs(message=msg))
@@ -93,25 +103,33 @@ def _open_report(
                 "Perhaps you need to delete it? Got error:\n\n"
                 f"{indent(traceback.format_exc(), '    ')}"
             ) from None
+        # a report created before a config change would otherwise keep its old format
+        report.image_format = cfg.report_image_format["raster"]
         try:
             yield report
         finally:
-            try:
-                _finalize(
-                    report=report,
-                    exec_params=exec_params,
-                    subject=subject,
-                    session=session,
-                    run=run,
-                    task=task,
-                )
-            except Exception as exc:
-                logger.warning(f"Failed: {exc}")
-            fname_report_html = fname_report.with_suffix(".html")
-            msg = f"Saving {name}: {_linkfile(fname_report_html)}"
-            logger.info(**gen_log_kwargs(message=msg))
-            report.save(fname_report, overwrite=True)
-            report.save(fname_report_html, overwrite=True, open_browser=False)
+            # MNE < 1.13 has no unsaved_changes, so fall back to always saving there
+            if getattr(report, "unsaved_changes", True):
+                try:
+                    _finalize(
+                        cfg=cfg,
+                        report=report,
+                        exec_params=exec_params,
+                        subject=subject,
+                        session=session,
+                        run=run,
+                        task=task,
+                    )
+                except Exception as exc:
+                    logger.warning(f"Failed: {exc}")
+                fname_report_html = fname_report.with_suffix(".html")
+                msg = f"Saving {name}: {_linkfile(fname_report_html)}"
+                logger.info(**gen_log_kwargs(message=msg), sanitize=False)
+                report.save(fname_report, overwrite=True)
+                report.save(fname_report_html, overwrite=True, open_browser=False)
+            else:
+                msg = f"Not saving unmodified {name}"
+                logger.debug(**gen_log_kwargs(message=msg))
 
 
 # def plot_full_epochs_decoding_scores(
@@ -154,23 +172,58 @@ def _plot_full_epochs_decoding_scores(
     scores: list[FloatArrayT],
     metric: str,
     kind: Literal["single-subject", "grand-average"] = "single-subject",
-) -> tuple[matplotlib.figure.Figure, str, pd.DataFrame]:
+) -> "tuple[matplotlib.figure.Figure, str, pd.DataFrame]":
     """Plot cross-validation results from full-epochs decoding."""
     import matplotlib.pyplot as plt  # nested import to help joblib
+    import pandas as pd
     import seaborn as sns
 
     if metric == "roc_auc":
         metric = "ROC AUC"
     score_label = f"Score ({metric})"
 
+    if len(contrast_names) != len(scores):
+        raise ValueError(
+            "The number of contrast names does not match the score arrays: "
+            f"{len(contrast_names)} != {len(scores)}"
+        )
+
+    score_lengths = [len(this_scores) for this_scores in scores]
+    if sum(score_lengths):
+        contrast_column = np.concatenate(
+            [
+                np.repeat(contrast_name, score_length)
+                for contrast_name, score_length in zip(contrast_names, score_lengths)
+            ]
+        )
+        score_column = np.hstack(scores)
+    else:
+        contrast_column = np.empty(0, dtype=str)
+        score_column = np.empty(0, dtype=float)
+
     data = pd.DataFrame(
         {
-            "Contrast": np.array(
-                [[c] * len(scores[0]) for c in contrast_names]
-            ).flatten(),
-            score_label: np.hstack(scores),
+            "Contrast": contrast_column,
+            score_label: score_column,
         }
     )
+
+    if data.empty or not np.isfinite(data[score_label]).any():
+        fig, ax = plt.subplots(constrained_layout=True)
+        ax.text(
+            0.5,
+            0.5,
+            "No valid decoding scores available",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
+        ax.set_axis_off()
+        if kind == "grand-average":
+            caption = "No valid subject-level decoding scores were available."
+        else:
+            caption = "No valid cross-validation scores were available."
+        return fig, caption, data
 
     if kind == "grand-average":
         # First create a grid of boxplots …
@@ -179,16 +232,24 @@ def _plot_full_epochs_decoding_scores(
             y=score_label,
             kind="box",
             col="Contrast",
+            col_order=contrast_names,
             col_wrap=3,
             aspect=0.33,
         )
         # … and now add swarmplots on top to visualize every single data point.
         g.map_dataframe(sns.swarmplot, y=score_label, color="black")
+        if len(set(score_lengths)) == 1:
+            sample_size = f"Based on effective N={score_lengths[0]} subjects. "
+        else:
+            sample_size_items = []
+            for name, n_subjects in zip(contrast_names, score_lengths):
+                name = name.replace("\n", " ")
+                sample_size_items.append(f"{name}: N={n_subjects}")
+            sample_sizes = "; ".join(sample_size_items)
+            sample_size = f"Effective sample size by contrast: {sample_sizes}. "
         caption = (
-            f"Based on N={len(scores[0])} "
-            f"subjects. Each dot represents the mean cross-validation score "
-            f"for a single subject. The dashed line is expected chance "
-            f"performance."
+            f"{sample_size}Each dot represents the mean cross-validation score "
+            f"for a single subject. The dashed line is expected chance performance."
         )
     else:
         # First create a grid of swarmplots to visualize every single
@@ -198,6 +259,7 @@ def _plot_full_epochs_decoding_scores(
             y=score_label,
             kind="swarm",
             col="Contrast",
+            col_order=contrast_names,
             col_wrap=3,
             aspect=0.33,
             color="black",
@@ -239,7 +301,7 @@ def _plot_time_by_time_decoding_scores(
     metric: str,
     time_generalization: bool,
     decim: int,
-) -> matplotlib.figure.Figure:
+) -> "matplotlib.figure.Figure":
     """Plot cross-validation results from time-by-time decoding."""
     import matplotlib.pyplot as plt  # nested import to help joblib
 
@@ -279,7 +341,7 @@ def _plot_time_by_time_decoding_scores(
 
 
 def _label_time_by_time(
-    ax: matplotlib.axes.Axes,
+    ax: "matplotlib.axes.Axes",
     *,
     decim: int,
     xlabel: str | None = None,
@@ -296,7 +358,7 @@ def _label_time_by_time(
 
 def _plot_time_by_time_decoding_scores_gavg(
     *, cfg: SimpleNamespace, decoding_data: dict[str, Any]
-) -> matplotlib.figure.Figure:
+) -> "matplotlib.figure.Figure":
     """Plot the grand-averaged decoding scores."""
     import matplotlib.pyplot as plt  # nested import to help joblib
 
@@ -387,7 +449,7 @@ def _plot_time_by_time_decoding_scores_gavg(
 
 def plot_time_by_time_decoding_t_values(
     decoding_data: dict[str, Any],
-) -> matplotlib.figure.Figure:
+) -> "matplotlib.figure.Figure":
     """Plot the t-values used to form clusters for the permutation test."""
     import matplotlib.pyplot as plt  # nested import to help joblib
 
@@ -433,7 +495,7 @@ def _plot_decoding_time_generalization(
     decoding_data: dict[str, Any],
     metric: str,
     kind: Literal["single-subject", "grand-average"],
-) -> matplotlib.figure.Figure:
+) -> "matplotlib.figure.Figure":
     """Plot time generalization matrix."""
     import matplotlib.pyplot as plt  # nested import to help joblib
 
@@ -484,14 +546,17 @@ def _plot_decoding_time_generalization(
 
 def _gen_empty_report(
     *, cfg: SimpleNamespace, subject: str, session: str | None
-) -> mne.Report:
+) -> "mne.Report":
     title = f"sub-{subject}"
     if session is not None:
         title += f", ses-{session}"
-    if cfg.task is not None:
-        title += f", task-{cfg.task}"
 
-    report = mne.Report(title=title, raw_psd=True, verbose=False)
+    report = mne.Report(
+        title=title,
+        raw_psd=True,
+        image_format=cfg.report_image_format["raster"],
+        verbose=False,
+    )
     return report
 
 
@@ -504,8 +569,11 @@ def add_event_counts(
     cfg: SimpleNamespace,
     subject: str | None,
     session: str | None,
-    report: mne.Report,
+    task: str | None,
+    report: "mne.Report",
 ) -> None:
+    from mne.report.report import _df_bootstrap_table
+
     try:
         df_events = count_events(BIDSPath(root=cfg.bids_root, session=session))
     except ValueError:
@@ -526,14 +594,22 @@ def add_event_counts(
 
 def _finalize(
     *,
-    report: mne.Report,
+    report: "mne.Report",
     exec_params: SimpleNamespace,
+    # passed so logging magic can occur:
+    cfg: SimpleNamespace,
     subject: str,
     session: str | None,
     run: str | None,
     task: str | None,
 ) -> None:
     """Add system information and the pipeline configuration to the report."""
+    _add_flow_diagram(
+        report=report,
+        exec_params=exec_params,
+        subject=subject,
+        session=session,
+    )
     # ensure they are always appended
     titles = ["Configuration file", "System information"]
     for title in titles:
@@ -561,6 +637,73 @@ div.accordion-body pre.my-0 code {
 """
     if css not in report.include:
         report.add_custom_css(css=css)
+    # Parallelization over runs adds sections in completion order (gh-845)
+    _sort_run_sections(report)
+
+
+def _run_sort_key(run: str) -> tuple[int, int | str]:
+    """Sort numeric run labels numerically, before any non-numeric ones."""
+    try:
+        return (0, int(run))
+    except ValueError:
+        return (1, run)
+
+
+def _sort_run_sections(report: "mne.Report") -> None:
+    """Order run-specific sections by run within each section group.
+
+    Sections that differ only by their ``run-*`` tag gather at the position the
+    first of them holds, sorted by run; everything else stays where it is.
+    """
+    anchors: dict[tuple[str, tuple[str, ...]], int] = dict()
+    keys: list[tuple[int, tuple[int, int | str], int]] = list()
+    titles, all_tags, _ = report.get_contents()
+    for idx, (title, tags) in enumerate(zip(titles, all_tags)):
+        for tag in tags:
+            if tag.startswith("run-"):
+                run = tag.removeprefix("run-")
+                break
+        else:
+            keys.append((idx, (0, 0), idx))
+            continue
+        # No need to disambiguate further: replace= targeting means the pipeline
+        # never reuses a title across sections
+        ident = (
+            title.replace(f"run-{run}", "run"),
+            tuple(sorted(tag for tag in tags if not tag.startswith("run-"))),
+        )
+        keys.append((anchors.setdefault(ident, idx), _run_sort_key(run), idx))
+    order = sorted(range(len(keys)), key=keys.__getitem__)
+    if order != list(range(len(order))):
+        report.reorder(order)
+
+
+def _add_flow_diagram(
+    *,
+    report: "mne.Report",
+    exec_params: SimpleNamespace,
+    subject: str,
+    session: str | None,
+) -> None:
+    """Add a diagram of the steps that ran and the files they exchanged."""
+    try:
+        html = _report_flow_html(
+            deriv_root=exec_params.deriv_root, subject=subject, session=session
+        )
+    except Exception as exc:
+        logger.warning(**gen_log_kwargs(message=f"Flow diagram failed: {exc}"))
+        return
+    if html is None:  # nothing recorded yet, e.g. reports from older runs
+        return
+    # remove+add rather than replace=True so it stays pinned near the end, just
+    # before the config/sys-info sections that _finalize re-appends after us
+    title = "Pipeline flow"
+    report.remove(title=title, remove_all=True)
+    report.add_html(
+        html,
+        title=title,
+        tags=("pipeline-flow",),
+    )
 
 
 # We make a lot of calls to this function and it takes > 1 sec generally
@@ -572,23 +715,64 @@ def _cached_sys_info() -> str:
         return f.getvalue()
 
 
-def _all_conditions(*, cfg: SimpleNamespace) -> list[str]:
+def _all_conditions(*, cfg: SimpleNamespace, task: str | None) -> list[str]:
     if isinstance(cfg.conditions, dict):
-        conditions = list(cfg.conditions.keys())
+        conditions_dict: dict[str, str]
+        # Need to inspect if it's nested or not
+        for key, val in cfg.conditions.items():
+            if isinstance(val, str):
+                conditions_dict = cfg.conditions
+                break
+        else:
+            conditions_dict = cfg.conditions[task]
+        conditions = list(conditions_dict)
     else:
         conditions = list(cfg.conditions)
-    all_contrasts = get_all_contrasts(cfg)
+    all_contrasts = _get_task_contrasts(contrasts=cfg.contrasts, task=task)
     conditions.extend([contrast["name"] for contrast in all_contrasts])
     return conditions
 
 
 def _sanitize_cond_tag(cond: str) -> str:
-    return str(cond).lower().replace("'", "").replace('"', "").replace(" ", "-")
+    return str(cond).replace("'", "").replace('"', "").replace(" ", "-")
+
+
+def _get_prefix_tags(
+    *,
+    cfg: SimpleNamespace,
+    task: str | None,
+    run: str | None = None,
+    condition: str | None = None,
+    contrast: tuple[str, str] | None = None,
+    add_contrast: bool = False,
+) -> tuple[str, tuple[str, ...]]:
+    prefixes = []
+    tags: tuple[str, ...] = ()
+    if task is not None and len(cfg.all_tasks) > 1:
+        prefixes.append(f"task-{task}")
+        tags += (f"task-{task}",)
+    if run is not None:
+        prefixes.append(f"run-{run}")
+        tags += (f"run-{run}",)
+    if condition is not None:
+        condition = _sanitize_cond_tag(condition)
+        prefixes += (condition,)
+        tags += (condition,)
+    if contrast is not None:
+        cond_1 = _sanitize_cond_tag(contrast[0])
+        cond_2 = _sanitize_cond_tag(contrast[1])
+        tags += (f"{cond_1}–{cond_2}",)
+        if add_contrast:
+            prefixes.append(f"{cond_1} vs. {cond_2}")
+    prefix = " ".join(prefixes)
+    if prefix:
+        prefix = f": {prefix}"
+    return prefix, tags
 
 
 def _imshow_tf(
     vals: FloatArrayT,
-    ax: matplotlib.axes.Axes,
+    ax: "matplotlib.axes.Axes",
     *,
     tmin: FloatArrayT,
     tmax: FloatArrayT,
@@ -599,7 +783,7 @@ def _imshow_tf(
     cmap: str = "RdBu_r",
     mask: FloatArrayT | None = None,
     cmap_masked: Any | None = None,
-) -> matplotlib.image.AxesImage:
+) -> "matplotlib.image.AxesImage":
     """Plot CSP TF decoding scores."""
     # XXX Add support for more metrics
     assert len(vals) == len(tmin) == len(tmax) == len(fmin) == len(fmax)
@@ -627,14 +811,20 @@ def add_csp_grand_average(
     cfg: SimpleNamespace,
     subject: str,
     session: str | None,
-    report: mne.Report,
+    task: str | None,
+    report: "mne.Report",
     cond_1: str,
     cond_2: str,
     fname_csp_freq_results: BIDSPath,
-    fname_csp_cluster_results: pd.DataFrame | None,
+    fname_csp_cluster_results: "pd.DataFrame | None",
 ) -> None:
     """Add CSP decoding results to the grand average report."""
     import matplotlib.pyplot as plt  # nested import to help joblib
+    import matplotlib.transforms
+    import pandas as pd
+    from scipy.io import loadmat
+
+    from ._decoding import _handle_csp_args
 
     # First, plot decoding scores across frequency bins (entire epochs).
     section = f"Decoding: CSP, N = {len(cfg.subjects)}"
@@ -702,14 +892,15 @@ def add_csp_grand_average(
     ax.legend()
     ax.set_xlabel("Frequency (Hz)")
     ax.set_ylabel(f"Mean decoding score ({metric})")
-    tags = (
+    prefix, extra_tags = _get_prefix_tags(cfg=cfg, task=task)
+    tags: tuple[str, ...] = (
         "epochs",
         "contrast",
         "decoding",
         "csp",
         f"{_sanitize_cond_tag(cond_1)}–{_sanitize_cond_tag(cond_2)}",
-    )
-    title = f"CSP decoding: {cond_1} vs. {cond_2}"
+    ) + extra_tags
+    title = f"CSP decoding: {prefix}{cond_1} vs. {cond_2}"
     report.add_figure(
         fig=fig,
         title=title,
@@ -845,8 +1036,8 @@ def add_csp_grand_average(
         "decoding",
         "csp",
         f"{_sanitize_cond_tag(cond_1)}–{_sanitize_cond_tag(cond_2)}",
-    )
-    title = f"CSP TF decoding: {cond_1} vs. {cond_2}"
+    ) + extra_tags
+    title = f"CSP TF decoding{prefix}{cond_1} vs. {cond_2}"
     report.add_figure(
         fig=fig,
         title=title,
@@ -880,23 +1071,21 @@ def _agg_backend() -> Generator[None, None, None]:
 def _add_raw(
     *,
     cfg: SimpleNamespace,
-    report: mne.report.Report,
+    report: "mne.report.Report",
     bids_path_in: BIDSPath,
-    raw: BaseRaw,
-    title: str,
+    raw: "BaseRaw",
+    title_prefix: str,
     tags: tuple[str, ...] = (),
     extra_html: str | None = None,
 ) -> None:
-    if bids_path_in.run is not None:
-        title += f", run {bids_path_in.run}"
-    elif bids_path_in.task in ("noise", "rest"):
-        title += f", {bids_path_in.task}"
+    prefix, extra_tags = _get_prefix_tags(cfg=cfg, task=bids_path_in.task)
+    title = f"{title_prefix}{prefix}"
     plot_raw_psd = (
         cfg.plot_psd_for_runs == "all"
         or bids_path_in.run in cfg.plot_psd_for_runs
         or bids_path_in.task in cfg.plot_psd_for_runs
     )
-    tags = ("raw", f"run-{bids_path_in.run}") + tags
+    tags = ("raw",) + tags + extra_tags
     with mne.use_log_level("error"):
         report.add_raw(
             raw=raw,
@@ -920,11 +1109,11 @@ def _add_raw(
 def _render_bem(
     *,
     cfg: SimpleNamespace,
-    report: mne.report.Report,
+    report: "mne.report.Report",
     subject: str,
     session: str | None,
 ) -> None:
-    logger.info(**gen_log_kwargs(message="Rendering MRI slices with BEM contours."))
+    logger.info(**gen_log_kwargs(message="Rendering MRI slices with BEM contours"))
     report.add_bem(
         subject=cfg.fs_subject,
         subjects_dir=cfg.fs_subjects_dir,

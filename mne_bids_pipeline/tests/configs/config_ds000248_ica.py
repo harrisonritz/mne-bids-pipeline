@@ -1,4 +1,4 @@
-"""MNE Sample Data: ICA."""
+"""ds000248: MNE Sample Data ICA."""
 
 bids_root = "~/mne_data/ds000248"
 deriv_root = "~/mne_data/derivatives/mne-bids-pipeline/ds000248_ica"
@@ -25,3 +25,5 @@ ica_n_components = 0.8
 ica_max_iterations = 500
 
 interactive = False
+
+report_image_format = dict(raster="png")

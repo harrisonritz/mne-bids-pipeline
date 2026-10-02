@@ -9,28 +9,26 @@ from mne_bids import BIDSPath, get_bids_path_from_fname, read_raw_bids
 
 from ._config_utils import (
     _bids_kwargs,
-    _do_mf_autobad,
+    _get_task_conditions_dict,
     _pl,
     get_datatype,
     get_eog_channels,
-    get_mf_reference_run,
-    get_runs,
-    get_task,
+    get_mf_reference_run_task,
 )
 from ._io import _read_json
 from ._logging import gen_log_kwargs, logger
 from ._run import _update_for_splits
-from .typing import InFilesT, PathLike, RunKindT, RunTypeT
+from .typing import ConditionsTypeT, InFilesT, RunKindT, RunTypeT
 
 
 def make_epochs(
     *,
-    task: str,
+    task: str | None,
     subject: str,
     session: str | None,
     raw: mne.io.BaseRaw,
     event_id: dict[str, int] | Literal["auto"] | None,
-    conditions: Iterable[str] | dict[str, str],
+    conditions: ConditionsTypeT | dict[str, ConditionsTypeT],
     tmin: float,
     tmax: float,
     custom_metadata: pd.DataFrame | dict[str, Any] | None,
@@ -77,10 +75,10 @@ def make_epochs(
         # Construct metadata
         #
         # We only keep conditions that will be analyzed.
-        if isinstance(conditions, dict):
-            conditions = list(conditions.keys())
-        else:
-            conditions = list(conditions)  # Ensure we have a list
+        conditions_dict = _get_task_conditions_dict(conditions=conditions, task=task)
+        # We need the keys here because the events have already been remapped to our
+        # new names
+        conditions = list(conditions_dict)
 
         # Handle grouped / hierarchical event names.
         row_event_names = mne.event.match_event_names(
@@ -126,7 +124,11 @@ def make_epochs(
                         and "ses-" + session in custom_dict
                     ):
                         custom_dict = custom_dict["ses-" + session]
-                    if isinstance(custom_dict, dict) and "task-" + task in custom_dict:
+                    if (
+                        isinstance(custom_dict, dict)
+                        and task is not None
+                        and "task-" + task in custom_dict
+                    ):
                         custom_dict = custom_dict["task-" + task]
                     if isinstance(custom_dict, pd.DataFrame):
                         custom_df = custom_dict
@@ -202,7 +204,7 @@ def make_epochs(
     return epochs
 
 
-def annotations_to_events(*, raw_paths: list[PathLike | BIDSPath]) -> dict[str, int]:
+def annotations_to_events(*, raw_paths: list[BIDSPath]) -> dict[str, int]:
     """Generate a unique event name -> event code mapping.
 
     The mapping can that can be used across all passed raws.
@@ -228,6 +230,7 @@ def _rename_events_func(
     raw: mne.io.BaseRaw,
     subject: str,
     session: str | None,
+    task: str | None,
     run: str | None,
 ) -> None:
     """Rename events (actually, annotations descriptions) in ``raw``.
@@ -270,7 +273,20 @@ def _rename_events_func(
     raw.annotations.description = np.array(descriptions_list, dtype=str)
 
 
-def _load_data(cfg: SimpleNamespace, bids_path: BIDSPath) -> mne.io.BaseRaw:
+def _get_reader_extra_params(
+    *, cfg: SimpleNamespace, bids_path: BIDSPath
+) -> dict[str, Any]:
+    if cfg.reader_extra_params != {}:
+        return cfg.reader_extra_params
+    # empty
+    if cfg.use_maxwell_filter and bids_path.datatype == "meg":
+        return dict(allow_maxshield="yes")
+    return dict()
+
+
+def _load_data(
+    *, cfg: SimpleNamespace, exec_params: SimpleNamespace, bids_path: BIDSPath
+) -> mne.io.BaseRaw:
     # read_raw_bids automatically
     # - populates bad channels using the BIDS channels.tsv
     # - sets channels types according to BIDS channels.tsv `type` column
@@ -286,18 +302,21 @@ def _load_data(cfg: SimpleNamespace, bids_path: BIDSPath) -> mne.io.BaseRaw:
         # FIF), so read_raw_bids would fail. The FIF is expected to carry its
         # own bads, channel types, and annotations (the typical way to produce
         # such a FIF is read_raw_bids -> custom preprocessing -> raw.save()).
-        raw = mne.io.read_raw_fif(bids_path.fpath, **(cfg.reader_extra_params or {}))
+        raw = mne.io.read_raw_fif(
+            bids_path.fpath,
+            **_get_reader_extra_params(cfg=cfg, bids_path=bids_path),
+        )
     else:
         raw = read_raw_bids(
             bids_path=bids_path,
-            extra_params=cfg.reader_extra_params or {},
-            verbose=cfg.read_raw_bids_verbose,
+            extra_params=_get_reader_extra_params(cfg=cfg, bids_path=bids_path),
+            verbose=exec_params.read_raw_bids_verbose,
         )
 
     _crop_data(cfg, raw=raw, subject=subject)
 
     raw.load_data()
-    if hasattr(raw, "fix_mag_coil_types"):
+    if isinstance(raw, mne.io.Raw):  # fix_mag_coil_types is FIF-only
         raw.fix_mag_coil_types()
 
     return raw
@@ -417,6 +436,7 @@ def _fix_stim_artifact_func(cfg: SimpleNamespace, raw: mne.io.BaseRaw) -> None:
 def import_experimental_data(
     *,
     cfg: SimpleNamespace,
+    exec_params: SimpleNamespace,
     bids_path_in: BIDSPath,
     bids_path_bads_in: BIDSPath | None,
     data_is_rest: bool | None,
@@ -427,6 +447,8 @@ def import_experimental_data(
     ----------
     cfg
         The local configuration.
+    exec_params
+        The execution parameters.
     bids_path_in
         The BIDS path to the data to import.
     bids_path_bads_in
@@ -443,24 +465,27 @@ def import_experimental_data(
     subject = bids_path_in.subject
     session = bids_path_in.session
     run = bids_path_in.run
+    task = bids_path_in.task
 
     # 1. _load_data (_crop_data)
-    raw = _load_data(cfg=cfg, bids_path=bids_path_in)
-    # 2. _set_eeg_montage
-    _set_eeg_montage(cfg=cfg, raw=raw, subject=subject, session=session, run=run)
-    # 3. _create_bipolar_channels
+    raw = _load_data(cfg=cfg, exec_params=exec_params, bids_path=bids_path_in)
+    # 2. _create_bipolar_channels
     _create_bipolar_channels(
         cfg=cfg, raw=raw, subject=subject, session=session, run=run
     )
-    # 4. _drop_channels_func
+    # 3. _drop_channels_func
     _drop_channels_func(cfg=cfg, raw=raw, subject=subject, session=session)
+    # 4. _set_eeg_montage
+    _set_eeg_montage(cfg=cfg, raw=raw, subject=subject, session=session, run=run)
     # 5. _find_breaks_func
     _find_breaks_func(cfg=cfg, raw=raw, subject=subject, session=session, run=run)
     if data_is_rest is None:
         data_is_rest = (cfg.task == "rest") or cfg.task_is_rest
     if not data_is_rest:
         # 6. _rename_events_func
-        _rename_events_func(cfg=cfg, raw=raw, subject=subject, session=session, run=run)
+        _rename_events_func(
+            cfg=cfg, raw=raw, subject=subject, session=session, task=task, run=run
+        )
         # 7. _fix_stim_artifact_func
         _fix_stim_artifact_func(cfg=cfg, raw=raw)
 
@@ -478,6 +503,7 @@ def import_experimental_data(
 def import_er_data(
     *,
     cfg: SimpleNamespace,
+    exec_params: SimpleNamespace,
     bids_path_er_in: BIDSPath,
     bids_path_ref_in: BIDSPath | None,
     bids_path_er_bads_in: BIDSPath | None,
@@ -490,6 +516,8 @@ def import_er_data(
     ----------
     cfg
         The local configuration.
+    exec_params
+        The execution parameters.
     bids_path_er_in
         The BIDS path to the empty room data.
     bids_path_ref_in
@@ -506,15 +534,17 @@ def import_er_data(
     raw_er
         The imported data.
     """
-    raw_er = _load_data(cfg, bids_path_er_in)
+    raw_er = _load_data(cfg=cfg, exec_params=exec_params, bids_path=bids_path_er_in)
     session = bids_path_er_in.session
 
     _drop_channels_func(cfg, raw=raw_er, subject="emptyroom", session=session)
     if bids_path_er_bads_in is not None:
-        raw_er.info["bads"] = _read_bads_tsv(
+        all_bads = _read_bads_tsv(
             cfg=cfg,
             bids_path_bads=bids_path_er_bads_in,
         )
+        # There could be EEG channels in this list, so pick subset by name
+        raw_er.info["bads"] = [bad for bad in all_bads if bad in raw_er.ch_names]
 
     # Don't deal with ref for now (initial data quality / auto bad step)
     if bids_path_ref_in is None:
@@ -528,13 +558,14 @@ def import_er_data(
         # See _load_data: when reading a custom-preprocessed FIF from deriv_root,
         # bypass read_raw_bids because the BIDS sidecars don't exist there.
         raw_ref = mne.io.read_raw_fif(
-            bids_path_ref_in.fpath, **(cfg.reader_extra_params or {})
+            bids_path_ref_in.fpath,
+            **_get_reader_extra_params(cfg=cfg, bids_path=bids_path_ref_in),
         )
     else:
         raw_ref = read_raw_bids(
             bids_path_ref_in,
-            extra_params=cfg.reader_extra_params or {},
-            verbose=cfg.read_raw_bids_verbose,
+            extra_params=_get_reader_extra_params(cfg=cfg, bids_path=bids_path_ref_in),
+            verbose=exec_params.read_raw_bids_verbose,
         )
     if bids_path_ref_bads_in is not None:
         bads = _read_bads_tsv(
@@ -607,7 +638,7 @@ def _get_bids_path_in(
         subject=subject,
         run=run,
         session=session,
-        task=task or cfg.task,
+        task=task,
         acquisition=cfg.acq,
         recording=cfg.rec,
         space=cfg.space,
@@ -645,10 +676,12 @@ def _get_run_path(
     run: str | None,
     task: str | None,
     kind: RunKindT,
-    add_bads: bool | None = None,
+    add_bads: bool = False,
     allow_missing: bool = False,
     key: str | None = None,
 ) -> InFilesT:
+    assert isinstance(run, str) or run is None
+    assert isinstance(task, str) or task is None
     bids_path_in = _get_bids_path_in(
         cfg=cfg,
         subject=subject,
@@ -675,7 +708,7 @@ def _get_rest_path(
     subject: str,
     session: str | None,
     kind: RunKindT,
-    add_bads: bool | None = None,
+    add_bads: bool = False,
 ) -> InFilesT:
     if not (cfg.process_rest and not cfg.task_is_rest):
         return dict()
@@ -698,7 +731,8 @@ def _get_noise_path(
     session: str | None,
     kind: RunKindT,
     mf_reference_run: str | None,
-    add_bads: bool | None = None,
+    mf_reference_task: str | None,
+    add_bads: bool = False,
 ) -> InFilesT:
     if not (cfg.process_empty_room and get_datatype(config=cfg) == "meg"):
         return dict()
@@ -719,7 +753,7 @@ def _get_noise_path(
             subject=subject,
             session=session,
             run=mf_reference_run,
-            task=get_task(config=cfg),
+            task=mf_reference_task,
             kind=kind,
         )
         if getattr(cfg, "custom_proc", None) is not None:
@@ -770,12 +804,14 @@ def _get_run_rest_noise_path(
     task: str | None,
     kind: RunKindT,
     mf_reference_run: str | None,
-    add_bads: bool | None = None,
+    mf_reference_task: str | None,
+    add_bads: bool = False,
 ) -> InFilesT:
     if run is None and task in ("noise", "rest"):
         if task == "noise":
             path = _get_noise_path(
                 mf_reference_run=mf_reference_run,
+                mf_reference_task=mf_reference_task,
                 cfg=cfg,
                 subject=subject,
                 session=session,
@@ -804,19 +840,19 @@ def _get_run_rest_noise_path(
     return path
 
 
-def _get_mf_reference_run_path(
+def _get_mf_reference_path(
     *,
     cfg: SimpleNamespace,
     subject: str,
     session: str | None,
-    add_bads: bool | None = None,
+    add_bads: bool = False,
 ) -> InFilesT:
     return _get_run_path(
         cfg=cfg,
         subject=subject,
         session=session,
         run=cfg.mf_reference_run,
-        task=None,
+        task=cfg.mf_reference_task,
         kind="orig",
         add_bads=add_bads,
         key="raw_ref_run",
@@ -833,15 +869,13 @@ def _path_dict(
     *,
     cfg: SimpleNamespace,
     bids_path_in: BIDSPath,
-    add_bads: bool | None = None,
+    add_bads: bool = False,
     kind: RunKindT,
     allow_missing: bool,
     key: str | None = None,
     subject: str,
     session: str | None,
 ) -> InFilesT:
-    if add_bads is None:
-        add_bads = kind == "orig" and _do_mf_autobad(cfg=cfg)
     in_files = dict()
     key = key or f"raw_task-{bids_path_in.task}_run-{bids_path_in.run}"
     in_files[key] = bids_path_in
@@ -890,33 +924,68 @@ def _read_bads_tsv(
     return out
 
 
-def _import_data_kwargs(*, config: SimpleNamespace, subject: str) -> dict[str, Any]:
-    """Get config params needed for any raw data loading."""
+def _epochs_kwargs(*, config: SimpleNamespace) -> dict[str, Any]:
+    """Get the config params that :func:`make_epochs` consumes."""
     return dict(
-        # import_experimental_data / general
+        epochs_custom_metadata=config.epochs_custom_metadata,
+        epochs_metadata_tmin=config.epochs_metadata_tmin,
+        epochs_metadata_tmax=config.epochs_metadata_tmax,
+        epochs_metadata_keep_first=config.epochs_metadata_keep_first,
+        epochs_metadata_keep_last=config.epochs_metadata_keep_last,
+        epochs_metadata_query=config.epochs_metadata_query,
+        event_repeated=config.event_repeated,
+        rest_epochs_duration=config.rest_epochs_duration,
+        rest_epochs_overlap=config.rest_epochs_overlap,
+    )
+
+
+def _raw_path_kwargs(
+    *, config: SimpleNamespace, subject: str, session: str | None
+) -> dict[str, Any]:
+    """Get config params needed to work out *which* raw files a step deals with.
+
+    This is the subset of :func:`_import_data_kwargs` needed by steps that read
+    already-derived data and so never re-run the raw import itself. Steps that do
+    import raw data want :func:`_import_data_kwargs`, which builds on this.
+    """
+    mf_reference_run, mf_reference_task = get_mf_reference_run_task(
+        config=config, subject=subject, session=session
+    )
+    return dict(
         process_empty_room=config.process_empty_room,
         process_rest=config.process_rest,
         task_is_rest=config.task_is_rest,
         # _get_bids_path_in, _load_data, _get_noise_path: read raw input from
         # deriv_root (custom-preprocessed) instead of bids_root.
         custom_proc=config.custom_proc,
+        mf_reference_run=mf_reference_run,
+        mf_reference_task=mf_reference_task,
+        data_type=config.data_type,
+        ch_types=config.ch_types,
+        **_bids_kwargs(config=config),
+    )
+
+
+def _import_data_kwargs(
+    *, config: SimpleNamespace, subject: str, session: str | None
+) -> dict[str, Any]:
+    """Get config params needed for any raw data loading.
+
+    Automatic bad-channel detection params are *not* included; only
+    ``preprocessing/_01_data_quality`` does that, and it adds them itself.
+    """
+    return dict(
+        # import_experimental_data / general
+        task=config.task,
         # _get_raw_paths, _get_noise_path
         use_maxwell_filter=config.use_maxwell_filter,
-        mf_reference_run=get_mf_reference_run(config=config),
-        data_type=config.data_type,
-        # automatic add_bads
-        find_noisy_channels_meg=config.find_noisy_channels_meg,
-        find_flat_channels_meg=config.find_flat_channels_meg,
-        find_bad_channels_extra_kws=config.find_bad_channels_extra_kws,
         # 1. _load_data
         reader_extra_params=config.reader_extra_params,
         crop_runs=config.crop_runs,
-        read_raw_bids_verbose=config.read_raw_bids_verbose,
         # 2. _set_eeg_montage
         eeg_template_montage=config.eeg_template_montage,
         # 3. _create_bipolar_channels
         eeg_bipolar_channels=config.eeg_bipolar_channels,
-        ch_types=config.ch_types,
         eog_channels=config.eog_channels,
         # 4. _drop_channels_func
         drop_channels=config.drop_channels,
@@ -932,11 +1001,7 @@ def _import_data_kwargs(*, config: SimpleNamespace, subject: str) -> dict[str, A
         fix_stim_artifact=config.fix_stim_artifact,
         stim_artifact_tmin=config.stim_artifact_tmin,
         stim_artifact_tmax=config.stim_artifact_tmax,
-        # args used for all runs that process raw (reporting / writing)
-        plot_psd_for_runs=config.plot_psd_for_runs,
-        _raw_split_size=config._raw_split_size,
-        runs=get_runs(config=config, subject=subject),  # XXX needs to accept session!
-        **_bids_kwargs(config=config),
+        **_raw_path_kwargs(config=config, subject=subject, session=session),
     )
 
 

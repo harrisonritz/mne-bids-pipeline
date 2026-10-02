@@ -23,9 +23,8 @@ from mne_bids import BIDSPath
 from mne_bids_pipeline._config_utils import (
     _bids_kwargs,
     _get_ss,
-    get_eeg_reference,
     get_eog_channels,
-    get_runs,
+    get_runs_tasks,
 )
 from mne_bids_pipeline._logging import gen_log_kwargs, logger
 from mne_bids_pipeline._parallel import get_parallel_backend, parallel_func
@@ -169,7 +168,7 @@ def detect_bad_components(
     cfg: SimpleNamespace,
     which: Literal["eog", "ecg"],
     epochs: mne.BaseEpochs | None,
-    ica: mne.preprocessing.ICA,
+    ica: "mne.preprocessing.ICA",
     ch_names: list[str] | None,
     subject: str,
     session: str | None,
@@ -226,7 +225,7 @@ def get_input_fnames_find_ica_artifacts(
     bids_basename = BIDSPath(
         subject=subject,
         session=session,
-        task=cfg.task,
+        task=None,
         acquisition=cfg.acq,
         recording=cfg.rec,
         space=cfg.space,
@@ -238,13 +237,15 @@ def get_input_fnames_find_ica_artifacts(
     in_files = dict()
     in_files["epochs"] = bids_basename.copy().update(processing="icafit", suffix="epo")
     _update_for_splits(in_files, "epochs", single=True)
-    for run in cfg.runs:
-        key = f"raw_run-{run}"
+    for run, task in cfg.runs_tasks:
+        key = f"raw_task-{task}_run-{run}"
         in_files[key] = bids_basename.copy().update(
-            run=run, processing=cfg.processing, suffix="raw"
+            run=run, task=task, processing=cfg.processing, suffix="raw"
         )
         _update_for_splits(in_files, key, single=True)
-    in_files["ica"] = bids_basename.copy().update(processing="icafit", suffix="ica")
+    in_files["ica"] = bids_basename.copy().update(
+        processing="icafit", suffix="ica", task=None
+    )
     return in_files
 
 
@@ -260,8 +261,12 @@ def find_ica_artifacts(
     in_files: InFilesT,
 ) -> OutFilesT:
     """Run ICA."""
-    raw_fnames = [in_files.pop(f"raw_run-{run}") for run in cfg.runs]
-    bids_basename = raw_fnames[0].copy().update(processing=None, split=None, run=None)
+    raw_fnames = [
+        in_files.pop(f"raw_task-{task}_run-{run}") for run, task in cfg.runs_tasks
+    ]
+    bids_basename = (
+        raw_fnames[0].copy().update(processing=None, split=None, run=None, task=None)
+    )
     out_files = dict()
     out_files["ica"] = bids_basename.copy().update(processing="ica", suffix="ica")
     out_files["ecg"] = bids_basename.copy().update(processing="ica+ecg", suffix="ave")
@@ -286,7 +291,7 @@ def find_ica_artifacts(
     ica = mne.preprocessing.read_ica(in_files.pop("ica"))
 
     # Epochs used for ICA fitting
-    epochs = mne.read_epochs(in_files.pop("epochs"), preload=True)
+    epochs = mne.read_epochs(in_files.pop("epochs").fpath, preload=True)
 
     # ECG component detection
     epochs_ecg = None
@@ -702,7 +707,7 @@ _ICALABEL_CLASSES = [
 def _run_icalabel(
     *,
     cfg: SimpleNamespace,
-    ica: mne.preprocessing.ICA,
+    ica: "mne.preprocessing.ICA",
     epochs: mne.BaseEpochs,
     mne_exclude: list[int],
     subject: str,
@@ -760,7 +765,9 @@ def _run_icalabel(
         f"component{_pl(icalabel_ics)} in {len(epochs)} epochs."
     )
     logger.info(**gen_log_kwargs(message=msg))
-    icalabel_df = pd.DataFrame(icalabel_class_probabilities, columns=_ICALABEL_CLASSES)
+    icalabel_df = pd.DataFrame(
+        icalabel_class_probabilities, columns=np.array(_ICALABEL_CLASSES)
+    )
 
     icalabel_df["Component"] = [
         f"ICA{i:03d}" for i in range(len(icalabel_component_labels))
@@ -776,8 +783,8 @@ def _run_icalabel(
 
 def _add_report_icalabel(
     *,
-    report: mne.Report,
-    ica: mne.preprocessing.ICA,
+    report: "mne.Report",
+    ica: "mne.preprocessing.ICA",
     icalabel_report: list[tuple[str, float, bool]],
     icalabel_df: pd.DataFrame,
     tags: tuple[str, ...],
@@ -866,8 +873,7 @@ def get_config(
     session: str | None = None,
 ) -> SimpleNamespace:
     cfg = SimpleNamespace(
-        runs=get_runs(config=config, subject=subject),
-        task_is_rest=config.task_is_rest,
+        runs_tasks=get_runs_tasks(config=config, subject=subject, session=session),
         ica_use_eog_detection=config.ica_use_eog_detection,
         ica_eog_threshold=config.ica_eog_threshold,
         ica_use_ecg_detection=config.ica_use_ecg_detection,
@@ -878,7 +884,6 @@ def get_config(
         ica_class_thresholds=config.ica_class_thresholds,
         ica_plot_component_properties=config.ica_plot_component_properties,
         ch_types=config.ch_types,
-        eeg_reference=get_eeg_reference(config),
         eog_channels=config.eog_channels,
         processing="filt" if config.regress_artifact is None else "regress",
         **_bids_kwargs(config=config),
@@ -901,7 +906,7 @@ def main(*, config: SimpleNamespace) -> None:
         )
         logs = parallel(
             run_func(
-                cfg=get_config(config=config, subject=subject),
+                cfg=get_config(config=config, subject=subject, session=session),
                 exec_params=config.exec_params,
                 subject=subject,
                 session=session,

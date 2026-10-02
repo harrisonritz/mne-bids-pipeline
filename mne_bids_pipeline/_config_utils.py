@@ -3,6 +3,7 @@
 import copy
 import functools
 import pathlib
+import re
 from collections.abc import Iterable, Sequence, Sized
 from inspect import signature
 from types import ModuleType, SimpleNamespace
@@ -14,7 +15,7 @@ import numpy as np
 from mne_bids import BIDSPath
 
 from ._logging import gen_log_kwargs, logger
-from .typing import ArbitraryContrast
+from .typing import ArbitraryContrast, BaselineTypeT, ConditionsTypeT, ContrastSequenceT
 
 try:
     _set_keys_arbitrary_contrast = set(ArbitraryContrast.__required_keys__)
@@ -47,7 +48,9 @@ def get_fs_subject(
         assert isinstance(config.use_template_mri, str), type(config.use_template_mri)
         return config.use_template_mri
 
-    if session is not None:
+    if session is not None and _has_session_specific_anat(
+        subject, session, subjects_dir
+    ):
         return f"sub-{subject}_ses-{session}"
     elif (pathlib.Path(subjects_dir) / subject).exists():
         return subject
@@ -149,6 +152,74 @@ def _get_sessions(config: SimpleNamespace) -> tuple[str, ...]:
     return tuple(str(x) for x in sessions)
 
 
+def _get_task_float(val: dict[str, float] | float, task: str | None) -> float:
+    """Get the float value for a task."""
+    if isinstance(val, dict):
+        assert task is not None
+        task_float = val[task]
+    else:
+        task_float = val
+    return task_float
+
+
+def _get_task_average_epochs_tlims(
+    *,
+    config: SimpleNamespace,
+) -> tuple[float, float]:
+    # Not necessarily the right thing to do here, but since we can't concat epochs of
+    # different lengths, let's use the average tmin/tmax across tasks
+    vals = tuple(
+        np.mean([_get_task_float(epochs_lim, task=task) for task in config.all_tasks])
+        for epochs_lim in (config.epochs_tmin, config.epochs_tmax)
+    )
+    out = tuple(float(v) for v in vals)
+    assert len(out) == 2  # just to make mypy happy
+    return out
+
+
+def _get_task_baseline(
+    baseline: BaselineTypeT | dict[str, BaselineTypeT], task: str | None
+) -> BaselineTypeT:
+    """Get the baseline value for a task."""
+    if isinstance(baseline, dict):
+        assert task is not None
+        task_baseline = baseline[task]
+    else:
+        task_baseline = baseline
+    return task_baseline
+
+
+def _get_task_conditions_dict(
+    *,
+    conditions: ConditionsTypeT | dict[str, ConditionsTypeT],
+    task: str | None,
+) -> dict[str, str]:
+    """Get conditions for the current task as a dict mapping new to old names."""
+    out_conditions: dict[str, str] = dict()
+    if isinstance(conditions, Sequence):
+        for cond in conditions:
+            out_conditions[cond] = cond
+    else:
+        # This somewhat clunky looping (rather than just checking the first item)
+        # is needed to make mypy happy about the nested dicts
+        for key, val in conditions.items():
+            assert isinstance(key, str)
+            # if it's a string, it's a remapping
+            if isinstance(val, str):
+                out_conditions[key] = val
+            else:
+                # otherwise, it's a sequence or a remapping itself, and it's
+                # task-specific
+                if key == task:
+                    if isinstance(val, Sequence):
+                        for cond in val:
+                            out_conditions[cond] = cond
+                    else:
+                        out_conditions.update(val)
+    del task
+    return out_conditions
+
+
 def get_subjects_sessions(
     config: SimpleNamespace,
 ) -> dict[str, tuple[None] | tuple[str, ...]]:
@@ -160,15 +231,13 @@ def get_subjects_sessions(
 
     # find which tasks to ignore when deciding if a subj has data for a session
     ignore_datatypes = _get_ignore_datatypes(config)
-    if config.task == "":
-        ignore_tasks = None
-    else:
-        all_tasks = _get_entity_vals_cached(
-            root=config.bids_root,
-            entity_key="task",
-            ignore_datatypes=ignore_datatypes,
-        )
-        ignore_tasks = tuple(set(all_tasks) - set([config.task]))
+    tasks = get_tasks(config=config)
+    all_tasks = _get_entity_vals_cached(
+        root=config.bids_root,
+        entity_key="task",
+        ignore_datatypes=ignore_datatypes,
+    )
+    ignore_tasks = tuple(set(all_tasks) - set(tasks))
 
     # loop over subjs and check for available sessions
     subj_sessions: dict[str, tuple[None] | tuple[str, ...]] = dict()
@@ -212,10 +281,14 @@ def get_subjects_sessions(
 def get_subjects_given_session(
     config: SimpleNamespace, session: str | None
 ) -> tuple[str, ...]:
-    """Get the subjects who actually have data for a given session."""
-    sub_ses = get_subjects_sessions(config)
+    """Get the subjects who actually have data for a given session.
+
+    Steps call this at run time with their ``cfg``, so it reads the mapping that
+    ``get_config()`` already resolved instead of re-scanning the dataset (which
+    it used to do on every call, and then discard unless sessions were missing).
+    """
     subjects = (
-        tuple(sub for sub, ses in sub_ses.items() if session in ses)
+        tuple(sub for sub, ses in config.subjects_sessions.items() if session in ses)
         if config.allow_missing_sessions
         else config.subjects
     )
@@ -223,132 +296,60 @@ def get_subjects_given_session(
     return subjects
 
 
-def get_runs_all_subjects(
-    config: SimpleNamespace,
-) -> dict[str, tuple[None] | tuple[str, ...]]:
-    """Give the mapping between subjects and their runs.
-
-    Returns
-    -------
-    a dict of runs present in the bids_path
-    for each subject asked in the configuration file
-    (and not for each subject present in the bids_path).
-    """
-    # Use caching under the hood for speed
-    return _get_runs_all_subjects_cached(
-        bids_root=config.bids_root,
-        data_type=config.data_type,
-        ch_types=tuple(config.ch_types),
-        subjects=tuple(config.subjects) if config.subjects != "all" else "all",
-        exclude_subjects=tuple(config.exclude_subjects),
-        exclude_runs=tuple(config.exclude_runs) if config.exclude_runs else None,
-    )
-
-
-@functools.cache
-def _get_runs_all_subjects_cached(
-    **config_dict: dict[str, Any],
-) -> dict[str, tuple[None] | tuple[str, ...]]:
-    config = SimpleNamespace(**config_dict)
-    # Sometimes we check list equivalence for ch_types, so convert it back
-    config.ch_types = list(config.ch_types)
-    subj_runs: dict[str, tuple[None] | tuple[str, ...]] = dict()
-    for subject in get_subjects(config):
-        # Only traverse through the current subject's directory
-        valid_runs_subj = _get_entity_vals_cached(
-            config.bids_root / f"sub-{subject}",
-            entity_key="run",
-            ignore_datatypes=_get_ignore_datatypes(config),
-        )
-
-        # If we don't have any `run` entities, just set it to None, as we
-        # commonly do when creating a BIDSPath.
-        if valid_runs_subj:
-            if subject in (config.exclude_runs or {}):
-                valid_runs_subj = tuple(
-                    r for r in valid_runs_subj if r not in config.exclude_runs[subject]
-                )
-            subj_runs[subject] = valid_runs_subj
-        else:
-            subj_runs[subject] = (None,)
-
-    return subj_runs
-
-
-def get_intersect_run(config: SimpleNamespace) -> list[str | None]:
-    """Return the intersection of all the runs of all subjects."""
-    subj_runs = get_runs_all_subjects(config)
-    # Do not use something like:
-    # list(set.intersection(*map(set, subj_runs.values())))
-    # as it will not preserve order. Instead just be explicit and preserve order.
-    # We could use "sorted", but it's probably better to use the order provided by
-    # the user (if they want to put `runs=["02", "01"]` etc. it's better to use "02")
-    all_runs: list[str | None] = list()
-    for runs in subj_runs.values():
-        for run in runs:
-            if run not in all_runs:
-                all_runs.append(run)
-    return all_runs
-
-
-def get_runs(
+def _get_runs_sst(
     *,
     config: SimpleNamespace,
     subject: str,
-    verbose: bool = False,
-) -> list[str] | list[None]:
-    """Return a list of runs in the BIDS input data.
-
-    Parameters
-    ----------
-    subject
-        Returns a list of the runs of this subject.
-    verbose
-        Notify if different subjects do not share the same runs.
-
-    Returns
-    -------
-    The list of runs of the subject. If no BIDS `run` entity could be found,
-    returns `[None]`.
-    """
+    session: str | None,
+    task: str | None,
+) -> list[str | None]:
+    """Return a list of runs for a given task in the BIDS input data."""
     if subject == "average":  # Used when creating the report
         return [None]
 
-    runs = copy.deepcopy(config.runs)
-    subj_runs = get_runs_all_subjects(config=config)
-    valid_runs = subj_runs[subject]
+    kwargs = dict(ignore_datatypes=_get_ignore_datatypes(config))
+    # Only traverse through the current subject's directory
+    subj_root = config.bids_root / f"sub-{subject}"
+    # Limit to session of interest
+    if session is not None:
+        sessions = _get_entity_vals_cached(subj_root, entity_key="session", **kwargs)
+        kwargs["ignore_sessions"] = tuple(set(sessions) - set([session]))
+        del session
+    # Limit to task of interest
+    tasks = _get_entity_vals_cached(subj_root, entity_key="task", **kwargs)
+    if task:
+        kwargs["ignore_tasks"] = tuple(set(tasks) - set([task]))
+    del tasks
+    # Get the runs for that task
+    runs = _get_entity_vals_cached(subj_root, entity_key="run", **kwargs)
 
-    if len(get_subjects(config)) > 1:
-        # Notify if different subjects do not share the same runs
-
-        same_runs = True
-        for runs_sub_i in subj_runs.values():
-            if set(runs_sub_i) != set(list(subj_runs.values())[0]):
-                same_runs = False
-
-        if not same_runs and verbose:
-            msg = (
-                "Extracted all the runs. "
-                "Beware, not all subjects share the same "
-                "set of runs."
-            )
-            logger.info(**gen_log_kwargs(message=msg))
-
-    if runs == "all":
-        runs = list(valid_runs)
-
-    if not runs:
-        runs = [None]
+    # If we don't have any `run` entities, just set it to None, as we
+    # commonly do when creating a BIDSPath.
+    valid_runs: tuple[str, ...] | tuple[None]
+    if runs:
+        valid_runs = tuple(
+            r for r in runs if r not in (config.exclude_runs or {}).get(subject, [])
+        )
     else:
-        inclusion = set(runs).issubset(set(valid_runs))
-        if not inclusion:
-            raise ValueError(
-                f"Invalid run. It can be a subset of {valid_runs} but got {runs}"
-            )
-    runs_out = list(runs)
-    if runs_out != [None]:
-        runs_out = list(str(x) for x in runs_out)
-    return runs_out
+        valid_runs = (None,)
+    del runs
+
+    runs_sst: list[str | None] = list()
+    if config.runs == "all":
+        runs_sst[:] = valid_runs
+    elif isinstance(config.runs, dict):
+        runs_sst[:] = config.runs[task]
+    else:
+        assert isinstance(config.runs, list)
+        runs_sst[:] = config.runs
+
+    inclusion = set(runs_sst).issubset(set(valid_runs))
+    if not inclusion:
+        raise ValueError(
+            f"Invalid run. It can be a subset of {valid_runs} but got {runs_sst}"
+        )
+
+    return runs_sst
 
 
 def get_runs_tasks(
@@ -358,83 +359,110 @@ def get_runs_tasks(
     session: str | None,
     which: tuple[str, ...] = ("runs", "noise", "rest"),
 ) -> tuple[tuple[str | None, str | None], ...]:
-    """Get (run, task) tuples for all runs plus (maybe) rest."""
+    """Get (run, task) tuples for all requested tasks and runs plus (maybe) rest."""
     from ._import_data import _get_noise_path, _get_rest_path
 
     assert isinstance(which, tuple)
     assert all(isinstance(inc, str) for inc in which)
     assert all(inc in ("runs", "noise", "rest") for inc in which)
-    runs: list[str | None] = list()
-    tasks: list[str | None] = list()
+    runs_tasks: list[tuple[str | None, str | None]] = list()
     if "runs" in which:
-        runs.extend(get_runs(config=config, subject=subject))
-        tasks.extend([get_task(config=config)] * len(runs))
+        for task in get_tasks(config=config):
+            runs_tasks += [
+                (run, task)
+                for run in _get_runs_sst(
+                    config=config,
+                    subject=subject,
+                    session=session,
+                    task=task,
+                )
+            ]
     if "rest" in which:
         rest_path = _get_rest_path(
             cfg=config,
             subject=subject,
             session=session,
             kind="orig",
-            add_bads=False,
         )
         if rest_path:
-            runs.append(None)
-            tasks.append("rest")
+            runs_tasks.append((None, "rest"))
     if "noise" in which:
-        mf_reference_run = get_mf_reference_run(config=config)
+        mf_reference_run, mf_reference_task = get_mf_reference_run_task(
+            config=config,
+            subject=subject,
+            session=session,
+        )
         noise_path = _get_noise_path(
             mf_reference_run=mf_reference_run,
+            mf_reference_task=mf_reference_task,
             cfg=config,
             subject=subject,
             session=session,
             kind="orig",
-            add_bads=False,
         )
         if noise_path:
-            runs.append(None)
-            tasks.append("noise")
-    return tuple(zip(runs, tasks))
+            runs_tasks.append((None, "noise"))
+    return tuple(runs_tasks)
 
 
-def get_mf_reference_run(config: SimpleNamespace) -> str | None:
+def get_mf_reference_run_task(
+    config: SimpleNamespace,
+    subject: str,
+    session: str | None,
+) -> tuple[str | None, str | None]:
     # Retrieve to run identifier (number, name) of the reference run
+    run: str | None
+    task: str | None
+    if config.mf_reference_task is not None:
+        task = config.mf_reference_task
+    else:
+        task = get_tasks(config=config)[0]
+    task_runs = _get_runs_sst(
+        config=config,
+        subject=subject,
+        session=session,
+        task=task,
+    )
     if config.mf_reference_run is not None:
         assert isinstance(config.mf_reference_run, str), type(config.mf_reference_run)
-        return config.mf_reference_run
-    # Use the first run
-    inter_runs = get_intersect_run(config)
-    mf_ref_error = (config.mf_reference_run is not None) and (
-        config.mf_reference_run not in inter_runs
-    )
-    if mf_ref_error:
-        msg = (
-            f"You set mf_reference_run={config.mf_reference_run}, but your "
-            f"dataset only contains the following runs: {inter_runs}"
-        )
-        raise ValueError(msg)
-    if not inter_runs:
-        raise ValueError(
-            f"The intersection of runs by subjects is empty. "
-            f"Check the list of runs: "
-            f"{get_runs_all_subjects(config)}"
-        )
-    return inter_runs[0]
+        run = config.mf_reference_run
+        if run not in task_runs:
+            raise ValueError(
+                f"You set mf_reference_run={config.mf_reference_run}, but your "
+                "dataset only contains the following runs for "
+                f"{config.mf_reference_task=}: {task_runs}"
+            )
+    else:
+        run = task_runs[0]
+    return run, task
 
 
-def get_task(config: SimpleNamespace) -> str | None:
-    task = config.task
-    if task:
-        assert isinstance(task, str), type(task)
-        return task
+def get_tasks(config: SimpleNamespace) -> list[str | None]:
+    # We should only need to compute this once for a given run of the pipeline
+    if hasattr(config, "all_tasks"):
+        return list(config.all_tasks)
     _valid_tasks = _get_entity_vals_cached(
         root=config.bids_root,
         entity_key="task",
         ignore_datatypes=_get_ignore_datatypes(config),
     )
-    if not _valid_tasks:
-        return None
+    tasks: list[str | None] = list()
+    if config.task:
+        if isinstance(config.task, str):
+            tasks.append(config.task)
+        else:
+            tasks.extend(config.task)
+        if missing_tasks := (set(tasks) - set(_valid_tasks)):
+            raise ValueError(
+                "The following requested tasks were not found in the dataset: "
+                f"{missing_tasks}"
+            )
     else:
-        return _valid_tasks[0]
+        if not _valid_tasks:
+            tasks.append(None)
+        else:
+            tasks.extend(_valid_tasks)
+    return tasks
 
 
 def _get_ss(
@@ -445,6 +473,17 @@ def _get_ss(
         (subject, session)
         for subject, sessions in get_subjects_sessions(config).items()
         for session in sessions
+    ]
+
+
+def _get_sst(
+    *,
+    config: SimpleNamespace,
+) -> list[tuple[str, str | None, str | None]]:
+    return [
+        (subject, session, task)
+        for subject, session in _get_ss(config=config)
+        for task in get_tasks(config=config)
     ]
 
 
@@ -512,14 +551,14 @@ def get_ecg_channel(
     ecg_channel: str | dict[str, str],
     subject: str = "",
     session: str | None = "",
-) -> str:
+) -> str | None:
     out = _get_channels_generic(
         ecg_channel,
         subject,
         session,
         variable_name="ssp_ecg_channel",
     )
-    assert isinstance(out, str)  # mypy
+    assert isinstance(out, str | None)  # mypy
     return out
 
 
@@ -543,19 +582,37 @@ def sanitize_cond_name(cond: str) -> str:
     return cond
 
 
+@functools.cache
+def _cached_match(
+    *,
+    root: pathlib.Path,
+    subject: str | None,
+    session: str | None,
+    suffix: str | None,
+    datatype: str | None,
+) -> tuple[BIDSPath, list[BIDSPath]]:
+    bids_path = BIDSPath(
+        root=root,
+        subject=subject,
+        session=session,
+        suffix=suffix,
+        datatype=datatype,
+    )
+    return bids_path, bids_path.match()
+
+
 def get_mf_cal_fname(
     *, config: SimpleNamespace, subject: str, session: str | None
 ) -> pathlib.Path | None:
     msg = "Could not find Maxwell Filter calibration file {where}."
     if config.mf_cal_fname is None:
-        bids_path = BIDSPath(
+        bids_path, bids_match = _cached_match(
             subject=subject,
             session=session,
             suffix="meg",
             datatype="meg",
             root=config.bids_root,
         )
-        bids_match = bids_path.match()
         mf_cal_fpath = None
         if len(bids_match) > 0:
             mf_cal_fpath = bids_match[0].meg_calibration_fpath
@@ -587,14 +644,13 @@ def get_mf_ctc_fname(
 ) -> pathlib.Path | None:
     msg = "Could not find Maxwell Filter cross-talk file {where}."
     if config.mf_ctc_fname is None:
-        bids_path = BIDSPath(
+        bids_path, bids_match = _cached_match(
             subject=subject,
             session=session,
             suffix="meg",
             datatype="meg",
             root=config.bids_root,
         )
-        bids_match = bids_path.match()
         mf_ctc_fpath = None
         if len(bids_match) > 0:
             mf_ctc_fpath = bids_match[0].meg_crosstalk_fpath
@@ -662,6 +718,23 @@ def _get_bem_conductivity(cfg: SimpleNamespace) -> tuple[tuple[float, ...] | Non
     return conductivity, tag
 
 
+def get_src_fname(
+    *, fs_subjects_dir: pathlib.Path, fs_subject: str, spacing: str | int
+) -> pathlib.Path:
+    """Get the path to src file for the given spacing, tolerant of an extra dash."""
+    bem_dir = fs_subjects_dir / fs_subject / "bem"
+    stem = str(spacing)
+    stems = [stem]
+    match = re.fullmatch(r"([a-zA-Z]+)(\d+)", stem)
+    if match:
+        stems.append(f"{match.group(1)}-{match.group(2)}")
+    for this_stem in stems:
+        fname = bem_dir / f"{fs_subject}-{this_stem}-src.fif"
+        if fname.exists():
+            return fname
+    return bem_dir / f"{fs_subject}-{stem}-src.fif"
+
+
 def _meg_in_ch_types(ch_types: str) -> bool:
     return "mag" in ch_types or "grad" in ch_types or "meg" in ch_types
 
@@ -688,7 +761,7 @@ def get_noise_cov_bids_path(
     noise_cov_bp = BIDSPath(
         subject=subject,
         session=session,
-        task=cfg.task,
+        task=None,
         acquisition=cfg.acq,
         run=None,
         processing="clean",
@@ -715,14 +788,24 @@ def get_noise_cov_bids_path(
     return noise_cov_bp
 
 
-def get_all_contrasts(config: SimpleNamespace) -> Iterable[ArbitraryContrast]:
-    _validate_contrasts(config.contrasts)
+def _get_task_contrasts(
+    *, contrasts: ContrastSequenceT | dict[str, ContrastSequenceT], task: str | None
+) -> Iterable[ArbitraryContrast]:
     normalized_contrasts = []
-    for contrast in config.contrasts:
+    # contrasts is either a dict[str(task),Sequence] or a Sequence
+    use_contrasts: ContrastSequenceT
+    if isinstance(contrasts, dict):
+        assert task is not None
+        use_contrasts = contrasts.get(task, [])
+    else:
+        use_contrasts = contrasts
+    del contrasts
+    for contrast in use_contrasts:
         if isinstance(contrast, tuple):
+            assert len(contrast) == 2
             normalized_contrasts.append(
                 ArbitraryContrast(
-                    name=(contrast[0] + "+" + contrast[1]),
+                    name=f"{contrast[0]}-{contrast[1]}",
                     conditions=list(contrast),
                     weights=[1, -1],
                 )
@@ -732,23 +815,21 @@ def get_all_contrasts(config: SimpleNamespace) -> Iterable[ArbitraryContrast]:
     return normalized_contrasts
 
 
-def get_decoding_contrasts(config: SimpleNamespace) -> Iterable[tuple[str, str]]:
-    _validate_contrasts(config.contrasts)
+def _get_task_decoding_contrasts(
+    config: SimpleNamespace, *, task: str | None
+) -> Iterable[tuple[str, str]]:
     normalized_contrasts = []
-    for contrast in config.contrasts:
-        if isinstance(contrast, tuple):
-            normalized_contrasts.append(contrast)
-        else:
-            # If a contrast is an `ArbitraryContrast` and satisfies
-            # * has exactly two conditions (`check_len`)
-            # * weights sum to 0 (`check_sum`)
-            # Then the two conditions are used to perform decoding
-            check_len = len(contrast["conditions"]) == 2
-            check_sum = np.isclose(np.sum(contrast["weights"]), 0)
-            if check_len and check_sum:
-                cond_1 = contrast["conditions"][0]
-                cond_2 = contrast["conditions"][1]
-                normalized_contrasts.append((cond_1, cond_2))
+    for contrast in _get_task_contrasts(contrasts=config.contrasts, task=task):
+        # If a contrast is an `ArbitraryContrast` and satisfies
+        # * has exactly two conditions (`check_len`)
+        # * weights sum to 0 (`check_sum`)
+        # Then the two conditions are used to perform decoding
+        check_len = len(contrast["conditions"]) == 2
+        check_sum = np.isclose(np.sum(contrast["weights"]), 0)
+        if check_len and check_sum:
+            cond_1 = contrast["conditions"][0]
+            cond_2 = contrast["conditions"][1]
+            normalized_contrasts.append((cond_1, cond_2))
     return normalized_contrasts
 
 
@@ -778,26 +859,70 @@ def get_eeg_reference(
         return config.eeg_reference
 
 
-def _validate_contrasts(contrasts: list[tuple[str, str] | dict[str, Any]]) -> None:
-    for contrast in contrasts:
-        if isinstance(contrast, tuple):
-            if len(contrast) != 2:
-                raise ValueError("Contrasts' tuples MUST be two conditions")
-        elif isinstance(contrast, dict):
-            missing = ", ".join(
-                repr(m) for m in sorted(_set_keys_arbitrary_contrast - set(contrast))
+def _validate_contrasts(
+    contrasts: ContrastSequenceT | dict[str, ContrastSequenceT],
+    *,
+    tasks: str | None | list[str],
+) -> None:
+    tasks_list: list[str] | list[None]
+    if tasks is None:
+        tasks_list = [None]
+    elif isinstance(tasks, str):
+        tasks_list = [tasks]
+    else:
+        tasks_list = tasks
+    contrasts_dict: dict[str, ContrastSequenceT]
+    if not isinstance(contrasts, dict):
+        if len(tasks_list) > 1:
+            raise ValueError(
+                f"When multiple tasks are defined via:\nconfig.task={tasks!r}\n"
+                "contrasts must be a dict whose keys are task names and values are "
+                f"sequences of contrasts, but got:\n{contrasts!r}"
             )
-            if missing:
-                raise ValueError(
-                    f"Missing key{_pl(missing)} in contrast {contrast}: {missing}"
+        contrasts_dict = {str(tasks_list[0]): contrasts}
+    else:
+        contrasts_dict = contrasts
+    del contrasts
+    # Now it's always a dict
+    bad_keys = set(contrasts_dict) - set(tasks_list)
+    if bad_keys:
+        raise ValueError(
+            f"config.contrasts has keys {sorted(contrasts_dict)} which do not match "
+            f"the defined tasks {tasks_list} via config.task={tasks!r}."
+        )
+    for task, these_contrasts in contrasts_dict.items():
+        assert isinstance(these_contrasts, Sequence)
+        for ci, contrast in enumerate(these_contrasts):
+            where = f"for contrast for task={task!r} at index {ci}"
+            if isinstance(contrast, tuple):
+                if len(contrast) != 2:
+                    raise ValueError(
+                        "Contrasts' tuples MUST be two conditions, got "
+                        f"{len(contrast)=} {where}"
+                    )
+            elif isinstance(contrast, dict):
+                missing = ", ".join(
+                    repr(m)
+                    for m in sorted(_set_keys_arbitrary_contrast - set(contrast))
                 )
-            if len(contrast["conditions"]) != len(contrast["weights"]):
-                raise ValueError(
-                    f"Contrast {contrast['name']} has an "
-                    f"inconsistent number of conditions/weights"
-                )
-        else:
-            raise ValueError("Contrasts must be tuples or well-formed dicts")
+                if missing:
+                    raise ValueError(
+                        f"Missing key{_pl(missing)} in contrast {contrast} {where}: "
+                        f"{missing}"
+                    )
+                if len(contrast["conditions"]) != len(contrast["weights"]):
+                    raise ValueError(
+                        f"Contrast {contrast['name']} {where} has an "
+                        f"inconsistent number of conditions/weights"
+                    )
+            else:
+                raise ValueError("Contrasts must be tuples or well-formed dicts")
+
+
+def _get_step_title(module: ModuleType | None) -> str | None:
+    """Get a step's human-readable title: its docstring's first line, no period."""
+    doc = getattr(module, "__doc__", None) or ""
+    return doc.strip().split("\n")[0].rstrip(".") or None
 
 
 def _get_step_modules() -> dict[str, tuple[ModuleType, ...]]:
@@ -833,13 +958,25 @@ def _bids_kwargs(*, config: SimpleNamespace) -> dict[str, str | None]:
     """Get the standard BIDS config entries."""
     return dict(
         proc=config.proc,
-        task=get_task(config),
         datatype=get_datatype(config),
         acq=config.acq,
         rec=config.rec,
         space=config.space,
         bids_root=config.bids_root,
         deriv_root=config.deriv_root,
+        all_tasks=config.all_tasks,  # we compute this once and store it for brevity
+        report_image_format=config.report_image_format,  # _open_report needs it
+    )
+
+
+def _mf_cal_kwargs(
+    *, config: SimpleNamespace, subject: str, session: str | None
+) -> dict[str, Any]:
+    """Get the Maxwell filter calibration / cross-talk params."""
+    return dict(
+        mf_cal_fname=get_mf_cal_fname(config=config, subject=subject, session=session),
+        mf_ctc_fname=get_mf_ctc_fname(config=config, subject=subject, session=session),
+        mf_head_origin=config.mf_head_origin,
     )
 
 
@@ -863,7 +1000,6 @@ def _proj_path(
     return BIDSPath(
         subject=subject,
         session=session,
-        task=cfg.task,
         acquisition=cfg.acq,
         recording=cfg.rec,
         space=cfg.space,

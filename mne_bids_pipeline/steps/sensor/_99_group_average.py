@@ -5,6 +5,7 @@ The M/EEG-channel data are averaged for group averages.
 
 import os
 import os.path as op
+from collections.abc import Sequence
 from functools import partial
 from types import SimpleNamespace
 
@@ -16,13 +17,17 @@ from scipy.io import loadmat, savemat
 
 from mne_bids_pipeline._config_utils import (
     _bids_kwargs,
+    _get_task_conditions_dict,
+    _get_task_contrasts,
+    _get_task_decoding_contrasts,
+    _get_task_float,
     _pl,
     _restrict_analyze_channels,
-    get_decoding_contrasts,
     get_eeg_reference,
     get_sessions,
     get_subjects,
     get_subjects_given_session,
+    get_subjects_sessions,
 )
 from mne_bids_pipeline._decoding import _handle_csp_args
 from mne_bids_pipeline._logging import gen_log_kwargs, logger
@@ -30,6 +35,7 @@ from mne_bids_pipeline._parallel import get_parallel_backend, parallel_func
 from mne_bids_pipeline._report import (
     _all_conditions,
     _contrasts_to_names,
+    _get_prefix_tags,
     _open_report,
     _plot_decoding_time_generalization,
     _plot_full_epochs_decoding_scores,
@@ -40,6 +46,7 @@ from mne_bids_pipeline._report import (
     plot_time_by_time_decoding_t_values,
 )
 from mne_bids_pipeline._run import (
+    _ignore_warnings,
     _prep_out_files,
     _update_for_splits,
     failsafe_run,
@@ -53,6 +60,7 @@ def get_input_fnames_average_evokeds(
     cfg: SimpleNamespace,
     subject: str,
     session: str | None,
+    task: str | None,
 ) -> InFilesT:
     in_files = dict()
     # for each session, only use subjects who actually have data for that session
@@ -61,7 +69,7 @@ def get_input_fnames_average_evokeds(
         in_files[f"evoked-{this_subject}"] = BIDSPath(
             subject=this_subject,
             session=session,
-            task=cfg.task,
+            task=task,
             acquisition=cfg.acq,
             run=None,
             recording=cfg.rec,
@@ -84,35 +92,36 @@ def average_evokeds(
     exec_params: SimpleNamespace,
     subject: str,
     session: str | None,
+    task: str | None,
     in_files: InFilesT,
 ) -> OutFilesT:
     logger.info(**gen_log_kwargs(message="Creating grand averages"))
     # Container for all conditions:
-    conditions = _all_conditions(cfg=cfg)
+    conditions = _all_conditions(cfg=cfg, task=task)
     evokeds_nested: list[list[mne.Evoked]] = [list() for _ in range(len(conditions))]
 
-    keys = list(in_files)
-    subjects_in_grand_avg = list()
-    for key in keys:
-        if key.startswith("evoked-"):
-            subjects_in_grand_avg.append(key.replace("evoked-", ""))
-        else:
-            continue
-        fname_in = in_files.pop(key)
-        these_evokeds = mne.read_evokeds(fname_in)
+    subjects = get_subjects_given_session(cfg, session)
+    n_subjects = len(subjects)
+    for this_subject in subjects:
+        fname_in = in_files.pop(f"evoked-{this_subject}")
+        these_evokeds = mne.read_evokeds(fname_in.fpath)
         assert isinstance(these_evokeds, list)
         for idx, evoked in enumerate(these_evokeds):
+            assert isinstance(evoked, mne.Evoked)
             evokeds_nested[idx].append(evoked)  # Insert into the container
+    del this_subject
+    assert subject == "average", subject  # make sure we didn't bungle it
 
     evokeds: list[mne.Evoked] = list()
     for these_evokeds in evokeds_nested:
         if not these_evokeds:  # empty
             continue
-        evokeds.append(
-            mne.grand_average(
-                these_evokeds, interpolate_bads=cfg.interpolate_bads_grand_average
-            )  # Combine subjects
-        )
+        with _ignore_warnings("Only a single dataset was passed"):
+            evokeds.append(
+                mne.grand_average(
+                    these_evokeds, interpolate_bads=cfg.interpolate_bads_grand_average
+                )  # Combine subjects
+            )
         # Keep condition in comment
         evokeds[-1].comment = "Grand average: " + these_evokeds[0].comment
 
@@ -120,7 +129,7 @@ def average_evokeds(
     fname_out = out_files["evokeds"] = BIDSPath(
         subject=subject,
         session=session,
-        task=cfg.task,
+        task=task,
         acquisition=cfg.acq,
         run=None,
         processing="clean",
@@ -136,6 +145,8 @@ def average_evokeds(
     # given missing run)
     fname_verbose = fname_out.fpath.with_suffix(".fif.IS_INTENTIONALLY_EMPTY.txt")
     if not evokeds:
+        msg = "No evoked data present for any subject, writing empty file."
+        logger.info(**gen_log_kwargs(message=msg))
         fname_out.fpath.write_bytes(b"")
         fname_verbose.write_text("No evoked data present for any subject.\n", "utf-8")
         return _prep_out_files(exec_params=exec_params, out_files=out_files)
@@ -146,7 +157,7 @@ def average_evokeds(
 
     msg = f"Saving grand-averaged evoked sensor data: {fname_out.basename}"
     logger.info(**gen_log_kwargs(message=msg))
-    mne.write_evokeds(fname_out, evokeds, overwrite=True)
+    mne.write_evokeds(fname_out.fpath, evokeds, overwrite=True)
     if exec_params.interactive:
         for evoked in evokeds:
             evoked.plot()
@@ -154,7 +165,7 @@ def average_evokeds(
     # Reporting
     evokeds = [_restrict_analyze_channels(evoked, cfg) for evoked in evokeds]
     with _open_report(
-        cfg=cfg, exec_params=exec_params, subject=subject, session=session
+        cfg=cfg, exec_params=exec_params, subject=subject, session=session, task=task
     ) as report:
         # Add event stats.
         add_event_counts(
@@ -162,6 +173,7 @@ def average_evokeds(
             report=report,
             subject=subject,
             session=session,
+            task=task,
         )
 
         # Evoked responses
@@ -170,33 +182,37 @@ def average_evokeds(
             n_signals = len(evokeds) - n_contrasts
             msg = (
                 f"Adding {n_signals} evoked response{_pl(n_signals)} and "
-                f"{n_contrasts} contrast{_pl(n_contrasts)} to the report."
+                f"{n_contrasts} contrast{_pl(n_contrasts)} using N={n_subjects} "
+                "subject(s) to the report"
             )
         else:
             msg = "No evoked conditions or contrasts found."
         logger.info(**gen_log_kwargs(message=msg))
         # construct the common part of the titles
-        _title = f"N = {len(subjects_in_grand_avg)}"
-        if n_missing := (len(cfg.subjects) - len(subjects_in_grand_avg)):
+        _title = f"N = {n_subjects}"
+        if n_missing := (len(cfg.subjects) - n_subjects):
             _title += f"{n_missing} subjects excluded due to missing session data"
         for condition, evoked in zip(conditions, evokeds):
-            tags: tuple[str, ...] = ("evoked", _sanitize_cond_tag(condition))
-            if condition in cfg.conditions:
-                title = f"Average (sensor): {condition}, {_title}"
-            else:  # It's a contrast of two conditions.
-                title = f"Average (sensor) contrast: {condition}, {_title}"
-                tags = tags + ("contrast",)
-
-            report.add_evokeds(
-                evokeds=evoked,
-                titles=title,
-                projs=False,
-                tags=tags,
-                n_time_points=cfg.report_evoked_n_time_points,
-                # captions=evoked.comment,  # TODO upstream
-                replace=True,
-                n_jobs=1,  # don't auto parallelize
+            prefix, extra_tags = _get_prefix_tags(
+                cfg=cfg, task=task, condition=condition
             )
+            tags = ("evoked",) + extra_tags
+            if condition in cfg.conditions:
+                title = f"Average (sensor){prefix}, {_title}"
+            else:  # It's a contrast of two conditions.
+                title = f"Average (sensor) contrast{prefix}, {_title}"
+                tags = tags + ("contrast",)
+            with _ignore_warnings("No .* channel locations found, cannot create"):
+                report.add_evokeds(
+                    evokeds=evoked,
+                    titles=title,
+                    projs=False,
+                    tags=tags,
+                    n_time_points=cfg.report_evoked_n_time_points,
+                    # captions=evoked.comment,  # TODO upstream
+                    replace=True,
+                    n_jobs=1,  # don't auto parallelize
+                )
 
     assert len(in_files) == 0, list(in_files)
     return _prep_out_files(exec_params=exec_params, out_files=out_files)
@@ -246,14 +262,16 @@ def _get_epochs_in_files(
     cfg: SimpleNamespace,
     subject: str,
     session: str | None,
+    task: str | None,
 ) -> InFilesT:
     in_files = dict()
     # here we just need one subject's worth of Epochs, to get the time domain. But we
     # still must be careful that the subject actually has data for the requested session
+    subjects = get_subjects_given_session(cfg, session)
     in_files["epochs"] = BIDSPath(
-        subject=get_subjects_given_session(cfg, session)[0],
+        subject=subjects[0],
         session=session,
-        task=cfg.task,
+        task=task,
         acquisition=cfg.acq,
         run=None,
         recording=cfg.rec,
@@ -275,6 +293,7 @@ def _decoding_out_fname(
     session: str | None,
     cond_1: str | None,
     cond_2: str | None,
+    task: str | None,
     kind: str,
     extension: str = ".mat",
 ) -> BIDSPath:
@@ -292,7 +311,7 @@ def _decoding_out_fname(
     return BIDSPath(
         subject=subject,
         session=session,
-        task=cfg.task,
+        task=task,
         acquisition=cfg.acq,
         run=None,
         recording=cfg.rec,
@@ -311,23 +330,65 @@ def _get_input_fnames_decoding(
     cfg: SimpleNamespace,
     subject: str,
     session: str | None,
+    task: str | None,
     cond_1: str,
     cond_2: str,
     kind: str,
     extension: str = ".mat",
 ) -> InFilesT:
-    in_files = _get_epochs_in_files(cfg=cfg, subject="ignored", session=session)
-    for this_subject in cfg.subjects:
+    in_files = _get_epochs_in_files(
+        cfg=cfg, subject="ignored", session=session, task=task
+    )
+    subjects = get_subjects_given_session(cfg, session)
+    for this_subject in subjects:
         in_files[f"scores-{this_subject}"] = _decoding_out_fname(
             cfg=cfg,
             subject=this_subject,
             session=session,
+            task=task,
             cond_1=cond_1,
             cond_2=cond_2,
             kind=kind,
             extension=extension,
         )
     return in_files
+
+
+def _exclude_all_nan_decoding_subjects(
+    *,
+    mean_scores: FloatArrayT,
+    subjects: Sequence[str],
+    contrast_msg: str,
+) -> tuple[FloatArrayT, list[str]]:
+    """Exclude subject-level decoding results that contain only NaNs."""
+    if mean_scores.shape[0] != len(subjects):
+        raise ValueError(
+            "The number of subject score arrays does not match the subject list: "
+            f"{mean_scores.shape[0]} != {len(subjects)}"
+        )
+
+    all_nan = np.asarray(
+        np.isnan(mean_scores)
+        if mean_scores.ndim == 1
+        else np.isnan(mean_scores).all(axis=tuple(range(1, mean_scores.ndim))),
+        dtype=bool,
+    ).reshape(-1)
+    excluded_subjects = [
+        this_subject for this_subject, exclude in zip(subjects, all_nan) if exclude
+    ]
+    if excluded_subjects:
+        joined_subjects = ", ".join(excluded_subjects)
+        msg = (
+            f"Excluding {len(excluded_subjects)} subject(s) from the group decoding "
+            f"average for {contrast_msg} because their scores are all NaN: "
+            f"{joined_subjects}."
+        )
+        logger.warning(**gen_log_kwargs(message=msg))
+
+    valid_subjects = [
+        this_subject for this_subject, exclude in zip(subjects, all_nan) if not exclude
+    ]
+    return mean_scores[~all_nan], valid_subjects
 
 
 @failsafe_run(
@@ -342,17 +403,22 @@ def average_time_by_time_decoding(
     exec_params: SimpleNamespace,
     subject: str,
     session: str | None,
+    task: str | None,
     cond_1: str,
     cond_2: str,
     in_files: InFilesT,
 ) -> OutFilesT:
-    logger.info(**gen_log_kwargs(message="Averaging time-by-time decoding results"))
+    contrast_msg = f"{cond_1} – {cond_2}"
+    msg = f"Averaging time-by-time decoding results: {contrast_msg}"
+    logger.info(**gen_log_kwargs(message=msg))
     # Get the time points from the very first subject. They are identical
     # across all subjects and conditions, so this should suffice.
-    epochs = mne.read_epochs(in_files.pop("epochs"), preload=False)
-    dtg_decim = cfg.decoding_time_generalization_decim
-    if cfg.decoding_time_generalization and dtg_decim > 1:
-        epochs.decimate(dtg_decim, verbose="error")
+    epochs = mne.read_epochs(in_files.pop("epochs").fpath, preload=False)
+    decim = cfg.decoding_time_decim
+    if cfg.decoding_time_generalization:
+        decim = max(cfg.decoding_time_generalization_decim, decim)
+    if decim > 1:
+        epochs.decimate(decim, verbose="error")
     times = epochs.times
     del epochs
 
@@ -360,19 +426,38 @@ def average_time_by_time_decoding(
     if cfg.decoding_time_generalization:
         time_points_shape += (len(times),)
 
-    n_subjects = len(cfg.subjects)
-    mean = np.empty(time_points_shape)
-    mean_min = np.empty(time_points_shape)
-    mean_max = np.empty(time_points_shape)
-    mean_se = np.empty(time_points_shape)
-    mean_ci_lower = np.empty(time_points_shape)
-    mean_ci_upper = np.empty(time_points_shape)
+    subjects = get_subjects_given_session(cfg, session)
+    n_subjects_total = len(subjects)
+
+    # Extract mean CV scores from all subjects.
+    mean_scores: FloatArrayT = np.empty((n_subjects_total, *time_points_shape))
+
+    # Remaining in_files are all decoding data
+    assert len(in_files) == n_subjects_total, list(in_files.keys())
+    for sub_idx, key in enumerate(list(in_files)):
+        decoding_data = loadmat(in_files.pop(key))
+        mean_scores[sub_idx, :] = decoding_data["scores"].mean(axis=0)
+
+    mean_scores, subjects = _exclude_all_nan_decoding_subjects(
+        mean_scores=mean_scores,
+        subjects=subjects,
+        contrast_msg=contrast_msg,
+    )
+    n_subjects = len(subjects)
+
+    mean = np.full(time_points_shape, np.nan)
+    mean_min = np.full(time_points_shape, np.nan)
+    mean_max = np.full(time_points_shape, np.nan)
+    mean_se = np.full(time_points_shape, np.nan)
+    mean_ci_lower = np.full(time_points_shape, np.nan)
+    mean_ci_upper = np.full(time_points_shape, np.nan)
     contrast_score_stats = {
         "cond_1": cond_1,
         "cond_2": cond_2,
         "times": times,
         "N": n_subjects,
-        "decim": dtg_decim,
+        "subjects": subjects,
+        "decim": decim,
         "mean": mean,
         "mean_min": mean_min,
         "mean_max": mean_max,
@@ -385,15 +470,6 @@ def average_time_by_time_decoding(
         "cluster_n_permutations": np.nan,
         "clusters": list(),
     }
-
-    # Extract mean CV scores from all subjects.
-    mean_scores: FloatArrayT = np.empty((n_subjects, *time_points_shape))
-
-    # Remaining in_files are all decoding data
-    assert len(in_files) == n_subjects, list(in_files.keys())
-    for sub_idx, key in enumerate(list(in_files)):
-        decoding_data = loadmat(in_files.pop(key))
-        mean_scores[sub_idx, :] = decoding_data["scores"].mean(axis=0)
 
     # Cluster permutation test.
     # We can only permute for two or more subjects
@@ -431,6 +507,8 @@ def average_time_by_time_decoding(
             n_permutations=cfg.cluster_n_permutations,
             random_seed=cfg.random_state,
         )
+        msg = f"Found {len(clusters)} cluster{_pl(clusters)} for {contrast_msg}"
+        logger.info(**gen_log_kwargs(message=msg))
 
         contrast_score_stats.update(
             {
@@ -450,72 +528,79 @@ def average_time_by_time_decoding(
     #
     # For time generalization, all values (each time point vs each other)
     # are considered.
-    mean[:] = mean_scores.mean(axis=0)
-    mean_min[:] = mean_scores.min(axis=0)
-    mean_max[:] = mean_scores.max(axis=0)
+    if n_subjects:
+        mean[:] = mean_scores.mean(axis=0)
+        mean_min[:] = mean_scores.min(axis=0)
+        mean_max[:] = mean_scores.max(axis=0)
 
     # Finally, for each time point, bootstrap the mean, and calculate the
     # SD of the bootstrapped distribution: this is the standard error of
     # the mean. We also derive 95% confidence intervals.
-    rng = np.random.default_rng(seed=cfg.random_state)
-    for time_idx in range(len(times)):
-        if cfg.decoding_time_generalization:
-            data = mean_scores[:, time_idx, time_idx]
-        else:
-            data = mean_scores[:, time_idx]
-        scores_resampled = rng.choice(data, size=(cfg.n_boot, n_subjects), replace=True)
-        bootstrapped_means = scores_resampled.mean(axis=1)
+    if n_subjects:
+        rng = np.random.default_rng(seed=cfg.random_state)
+        for time_idx in range(len(times)):
+            if cfg.decoding_time_generalization:
+                data = mean_scores[:, time_idx, time_idx]
+            else:
+                data = mean_scores[:, time_idx]
+            scores_resampled = rng.choice(
+                data, size=(cfg.n_boot, n_subjects), replace=True
+            )
+            bootstrapped_means = scores_resampled.mean(axis=1)
 
-        # SD of the bootstrapped distribution == SE of the metric.
-        se = bootstrapped_means.std(ddof=1)
-        ci_lower = np.quantile(bootstrapped_means, q=0.025)
-        ci_upper = np.quantile(bootstrapped_means, q=0.975)
+            # SD of the bootstrapped distribution == SE of the metric.
+            se = bootstrapped_means.std(ddof=1)
+            ci_lower = np.quantile(bootstrapped_means, q=0.025)
+            ci_upper = np.quantile(bootstrapped_means, q=0.975)
 
-        mean_se[time_idx] = se
-        mean_ci_lower[time_idx] = ci_lower
-        mean_ci_upper[time_idx] = ci_upper
+            mean_se[time_idx] = se
+            mean_ci_lower[time_idx] = ci_lower
+            mean_ci_upper[time_idx] = ci_upper
 
-        del bootstrapped_means, se, ci_lower, ci_upper
+            del bootstrapped_means, se, ci_lower, ci_upper
 
     out_files = dict()
     out_files["mat"] = _decoding_out_fname(
         cfg=cfg,
         subject=subject,
         session=session,
+        task=task,
         cond_1=cond_1,
         cond_2=cond_2,
         kind="TimeByTime",
     )
     savemat(out_files["mat"], contrast_score_stats)
 
-    section = f"Decoding: time-by-time, N = {len(cfg.subjects)}"
+    section = f"Decoding: time-by-time, N = {len(subjects)}"
     with _open_report(
-        cfg=cfg, exec_params=exec_params, subject=subject, session=session
+        cfg=cfg, exec_params=exec_params, subject=subject, session=session, task=task
     ) as report:
-        logger.info(**gen_log_kwargs(message="Adding time-by-time decoding results"))
         import matplotlib.pyplot as plt
 
-        tags = (
-            "epochs",
-            "contrast",
-            "decoding",
-            f"{_sanitize_cond_tag(cond_1)}–{_sanitize_cond_tag(cond_2)}",
+        logger.info(**gen_log_kwargs(message="Adding time-by-time decoding results"))
+
+        prefix, extra_tags = _get_prefix_tags(
+            cfg=cfg, task=task, contrast=(cond_1, cond_2), add_contrast=True
         )
+        tags = ("epochs", "contrast", "decoding") + extra_tags
         decoding_data = loadmat(out_files["mat"])
+        effective_n = int(decoding_data["N"].squeeze())
 
         # Plot scores
         fig = _plot_time_by_time_decoding_scores_gavg(
             cfg=cfg,
             decoding_data=decoding_data,
         )
-        caption = (
-            f"Based on N={decoding_data['N'].squeeze()} "
-            f"subjects. Standard error and confidence interval "
-            f"of the mean were bootstrapped with {cfg.n_boot} "
-            f"resamples. CI must not be used for statistical inference here, "
-            f"as it is not corrected for multiple testing."
-        )
-        if len(get_subjects(cfg)) > 1:
+        if effective_n:
+            caption = (
+                f"Based on N={effective_n} subjects. Standard error and confidence "
+                f"interval of the mean were bootstrapped with {cfg.n_boot} "
+                f"resamples. CI must not be used for statistical inference here, "
+                f"as it is not corrected for multiple testing."
+            )
+        else:
+            caption = "No subjects had valid decoding scores for this contrast."
+        if effective_n > 1:
             caption += (
                 f" Time periods with decoding performance significantly above "
                 f"chance, if any, were derived with a one-tailed "
@@ -523,19 +608,19 @@ def average_time_by_time_decoding(
                 f"({decoding_data['cluster_n_permutations'].squeeze()} "
                 f"permutations) and are highlighted in yellow."
             )
-            title = f"Decoding over time: {cond_1} vs. {cond_2}"
-            report.add_figure(
-                fig=fig,
-                title=title,
-                caption=caption,
-                section=section,
-                tags=tags,
-                replace=True,
-            )
-            plt.close(fig)
+        title = f"Decoding over time: {cond_1} vs. {cond_2}"
+        report.add_figure(
+            fig=fig,
+            title=title,
+            caption=caption,
+            section=section,
+            tags=tags,
+            replace=True,
+        )
+        plt.close(fig)
 
         # Plot t-values used to form clusters
-        if len(get_subjects(cfg)) > 1:
+        if effective_n > 1:
             fig = plot_time_by_time_decoding_t_values(decoding_data=decoding_data)
             t_threshold = np.round(decoding_data["cluster_t_threshold"], 3).item()
             caption = (
@@ -544,7 +629,7 @@ def average_time_by_time_decoding(
             )
             report.add_figure(
                 fig=fig,
-                title=f"t-values across time: {cond_1} vs. {cond_2}",
+                title=f"t-values across time{prefix}",
                 caption=caption,
                 section=section,
                 tags=tags,
@@ -564,7 +649,7 @@ def average_time_by_time_decoding(
                 f"on all other time points. The results were averaged across "
                 f"N={decoding_data['N'].item()} subjects."
             )
-            title = f"Time generalization: {cond_1} vs. {cond_2}"
+            title = f"Time generalization{prefix}"
             report.add_figure(
                 fig=fig,
                 title=title,
@@ -592,17 +677,32 @@ def average_full_epochs_decoding(
     session: str | None,
     cond_1: str,
     cond_2: str,
+    task: str | None,
     in_files: InFilesT,
 ) -> OutFilesT:
-    n_subjects = len(cfg.subjects)
+    subjects = get_subjects_given_session(cfg, session)
+    n_subjects_total = len(subjects)
     in_files.pop("epochs")  # not used but okay to include
 
+    # Extract mean CV scores from all subjects.
+    mean_scores = np.empty(n_subjects_total)
+    for sub_idx, key in enumerate(list(in_files)):
+        decoding_data = loadmat(in_files.pop(key))
+        mean_scores[sub_idx] = decoding_data["scores"].mean()
+
+    contrast_msg = f"{cond_1} – {cond_2}"
+    mean_scores, subjects = _exclude_all_nan_decoding_subjects(
+        mean_scores=mean_scores,
+        subjects=subjects,
+        contrast_msg=contrast_msg,
+    )
+    n_subjects = len(subjects)
     contrast_score_stats = {
         "cond_1": cond_1,
         "cond_2": cond_2,
         "N": n_subjects,
-        "subjects": cfg.subjects,
-        "scores": np.nan,
+        "subjects": subjects,
+        "scores": mean_scores,
         "mean": np.nan,
         "mean_min": np.nan,
         "mean_max": np.nan,
@@ -611,39 +711,31 @@ def average_full_epochs_decoding(
         "mean_ci_upper": np.nan,
     }
 
-    # Extract mean CV scores from all subjects.
-    mean_scores = np.empty(n_subjects)
-    for sub_idx, key in enumerate(list(in_files)):
-        decoding_data = loadmat(in_files.pop(key))
-        mean_scores[sub_idx] = decoding_data["scores"].mean()
-
     # Now we can calculate some descriptive statistics on the mean scores.
-    # We use the [:] here as a safeguard to ensure we don't mess up the
-    # dimensions.
-    contrast_score_stats["scores"] = mean_scores
-    contrast_score_stats["mean"] = mean_scores.mean()
-    contrast_score_stats["mean_min"] = mean_scores.min()
-    contrast_score_stats["mean_max"] = mean_scores.max()
+    if n_subjects:
+        contrast_score_stats["mean"] = mean_scores.mean()
+        contrast_score_stats["mean_min"] = mean_scores.min()
+        contrast_score_stats["mean_max"] = mean_scores.max()
 
-    # Finally, bootstrap the mean, and calculate the
-    # SD of the bootstrapped distribution: this is the standard error of
-    # the mean. We also derive 95% confidence intervals.
-    rng = np.random.default_rng(seed=cfg.random_state)
-    scores_resampled = rng.choice(
-        mean_scores, size=(cfg.n_boot, n_subjects), replace=True
-    )
-    bootstrapped_means = scores_resampled.mean(axis=1)
+        # Finally, bootstrap the mean, and calculate the
+        # SD of the bootstrapped distribution: this is the standard error of
+        # the mean. We also derive 95% confidence intervals.
+        rng = np.random.default_rng(seed=cfg.random_state)
+        scores_resampled = rng.choice(
+            mean_scores, size=(cfg.n_boot, n_subjects), replace=True
+        )
+        bootstrapped_means = scores_resampled.mean(axis=1)
 
-    # SD of the bootstrapped distribution == SE of the metric.
-    se = bootstrapped_means.std(ddof=1)
-    ci_lower = np.quantile(bootstrapped_means, q=0.025)
-    ci_upper = np.quantile(bootstrapped_means, q=0.975)
+        # SD of the bootstrapped distribution == SE of the metric.
+        se = bootstrapped_means.std(ddof=1)
+        ci_lower = np.quantile(bootstrapped_means, q=0.025)
+        ci_upper = np.quantile(bootstrapped_means, q=0.975)
 
-    contrast_score_stats["mean_se"] = se
-    contrast_score_stats["mean_ci_lower"] = ci_lower
-    contrast_score_stats["mean_ci_upper"] = ci_upper
+        contrast_score_stats["mean_se"] = se
+        contrast_score_stats["mean_ci_lower"] = ci_lower
+        contrast_score_stats["mean_ci_upper"] = ci_upper
 
-    del bootstrapped_means, se, ci_lower, ci_upper
+        del bootstrapped_means, se, ci_lower, ci_upper
 
     out_files = dict()
     fname_out = out_files["mat"] = _decoding_out_fname(
@@ -652,6 +744,7 @@ def average_full_epochs_decoding(
         session=session,
         cond_1=cond_1,
         cond_2=cond_2,
+        task=task,
         kind="FullEpochs",
     )
     if not fname_out.fpath.parent.exists():
@@ -665,6 +758,7 @@ def get_input_files_average_full_epochs_report(
     cfg: SimpleNamespace,
     subject: str,
     session: str | None,
+    task: str | None,
     decoding_contrasts: list[list[str]],
 ) -> InFilesT:
     in_files = dict()
@@ -673,6 +767,7 @@ def get_input_files_average_full_epochs_report(
             cfg=cfg,
             subject=subject,
             session=session,
+            task=task,
             cond_1=contrast[0],
             cond_2=contrast[1],
             kind="FullEpochs",
@@ -689,6 +784,7 @@ def average_full_epochs_report(
     exec_params: SimpleNamespace,
     subject: str,
     session: str | None,
+    task: str | None,
     decoding_contrasts: list[list[str]],
     in_files: InFilesT,
 ) -> OutFilesT:
@@ -698,17 +794,18 @@ def average_full_epochs_report(
         cfg=cfg,
         subject=subject,
         session=session,
+        task=task,
         cond_1=None,
         cond_2=None,
         kind="FullEpochs",
         extension=".xlsx",
     )
-
     with _open_report(
-        cfg=cfg, exec_params=exec_params, subject=subject, session=session
+        cfg=cfg, exec_params=exec_params, subject=subject, session=session, task=task
     ) as report:
         import matplotlib.pyplot as plt  # nested import to help joblib
 
+        prefix, extra_tags = _get_prefix_tags(cfg=cfg, task=task)
         logger.info(
             **gen_log_kwargs(message="Adding full-epochs decoding results to report")
         )
@@ -730,23 +827,27 @@ def average_full_epochs_report(
         )
         with pd.ExcelWriter(out_files["cluster"]) as w:
             data.to_excel(w, sheet_name="FullEpochs", index=False)
+        effective_ns = [len(scores) for scores in all_decoding_scores]
+        if len(set(effective_ns)) == 1:
+            section = f"Decoding: full-epochs, N = {effective_ns[0]}"
+        else:
+            section = (
+                "Decoding: full-epochs, effective N = "
+                f"{min(effective_ns)}–{max(effective_ns)}"
+            )
+        tags = ("epochs", "contrast", "decoding") + extra_tags
+        tags += tuple(
+            f"{_sanitize_cond_tag(cond_1)}–{_sanitize_cond_tag(cond_2)}"
+            for cond_1, cond_2 in cfg.decoding_contrasts
+        )
         report.add_figure(
             fig=fig,
-            title="Full-epochs decoding",
-            section=f"Decoding: full-epochs, N = {len(cfg.subjects)}",
+            title=f"Full-epochs decoding{prefix}",
+            section=section,
             caption=caption,
-            tags=(
-                "epochs",
-                "contrast",
-                "decoding",
-                *[
-                    f"{_sanitize_cond_tag(cond_1)}–{_sanitize_cond_tag(cond_2)}"
-                    for cond_1, cond_2 in cfg.decoding_contrasts
-                ],
-            ),
+            tags=tags,
             replace=True,
         )
-        # close figure to save memory
         plt.close(fig)
     return _prep_out_files(exec_params=exec_params, out_files=out_files)
 
@@ -764,13 +865,16 @@ def average_csp_decoding(
     exec_params: SimpleNamespace,
     subject: str,
     session: str | None,
+    task: str | None,
     cond_1: str,
     cond_2: str,
     in_files: InFilesT,
 ) -> OutFilesT:
-    msg = f"Summarizing CSP results: {cond_1} - {cond_2}."
+    contrast_msg = f"{cond_1} – {cond_2}"
+    msg = f"Summarizing CSP results: {contrast_msg}"
     logger.info(**gen_log_kwargs(message=msg))
     in_files.pop("epochs")
+    subjects = get_subjects_given_session(cfg, session)
 
     all_decoding_data_freq = []
     all_decoding_data_time_freq = []
@@ -814,6 +918,7 @@ def average_csp_decoding(
         cfg=cfg,
         subject=subject,
         session=session,
+        task=task,
         cond_1=cond_1,
         cond_2=cond_2,
         kind="CSP",
@@ -828,7 +933,6 @@ def average_csp_decoding(
     del grand_average_time_freq
 
     # Perform a cluster-based permutation test.
-    subjects = cfg.subjects
     freq_name_to_bins_map, time_bins = _handle_csp_args(
         cfg.decoding_csp_times,
         cfg.decoding_csp_freqs,
@@ -859,7 +963,7 @@ def average_csp_decoding(
             ["subject", "freq_range_name", "t_min", "t_max"]
         )
 
-        for (subject_, freq_range_name, t_min, t_max), df in g:
+        for (subject_, freq_range_name, t_min, t_max), df in g:  # type: ignore
             scores = df["mean_crossval_score"]
             sub_idx = subjects.index(subject_)
             time_bin_idx = time_bins_df.loc[
@@ -876,7 +980,7 @@ def average_csp_decoding(
 
             cluster_forming_t_threshold = scipy.stats.t.ppf(
                 1 - 0.05,
-                len(cfg.subjects) - 1,  # one-sided test
+                len(subjects) - 1,  # one-sided test
             )
         else:
             cluster_forming_t_threshold = cfg.cluster_forming_t_threshold
@@ -900,7 +1004,13 @@ def average_csp_decoding(
                     out_type="mask",
                     tail=1,  # one-sided: significantly above chance level
                     seed=cfg.random_state,
+                    verbose="error",  # ignore No clusters found
                 )
+                msg = (
+                    f"Found {len(all_clusters)} cluster{_pl(all_clusters)} for "
+                    f"{contrast_msg} in {freq_range_name}"
+                )
+                logger.info(**gen_log_kwargs(message=msg))
             n_permutations = H0.size - 1
             all_clusters = np.array(all_clusters)  # preserve "empty" 0th dimension
             cluster_permutation_results[freq_range_name] = {
@@ -920,12 +1030,13 @@ def average_csp_decoding(
 
     assert subject == "average"
     with _open_report(
-        cfg=cfg, exec_params=exec_params, subject=subject, session=session
+        cfg=cfg, exec_params=exec_params, subject=subject, session=session, task=task
     ) as report:
         add_csp_grand_average(
             cfg=cfg,
             subject=subject,
             session=session,
+            task=task,
             report=report,
             cond_1=cond_1,
             cond_2=cond_2,
@@ -953,7 +1064,8 @@ def _average_csp_time_freq(
     grand_average["mean_ci_upper"] = np.nan
 
     # Now generate descriptive and bootstrapped statistics.
-    n_subjects = len(cfg.subjects)
+    subjects = get_subjects_given_session(cfg, session)
+    n_subjects = len(subjects)
     rng = np.random.default_rng(seed=cfg.random_state)
     for row_idx, row in grand_average.iterrows():
         all_scores = np.array([df.loc[row_idx, "mean_crossval_score"] for df in data])
@@ -962,7 +1074,7 @@ def _average_csp_time_freq(
 
         # Abort here if we only have a single subject – no need to bootstrap
         # CIs etc.
-        if len(cfg.subjects) == 1:
+        if n_subjects == 1:
             continue
 
         # Bootstrap the mean, and calculate the
@@ -997,28 +1109,33 @@ def _average_csp_time_freq(
     return grand_average
 
 
+# TODO: Eventually split out the sensor grand-averaging from the decoding steps so that
+# tweaking decoding params doesn't affect sensor-level grand averaging
 def get_config(
     *,
     config: SimpleNamespace,
+    task: str | None,
 ) -> SimpleNamespace:
     cfg = SimpleNamespace(
         subjects=get_subjects(config),
+        subjects_sessions=get_subjects_sessions(config),
         allow_missing_sessions=config.allow_missing_sessions,
-        task_is_rest=config.task_is_rest,
-        conditions=config.conditions,
-        contrasts=config.contrasts,
-        epochs_tmin=config.epochs_tmin,
-        epochs_tmax=config.epochs_tmax,
+        conditions=_get_task_conditions_dict(conditions=config.conditions, task=task),
+        contrasts=_get_task_contrasts(contrasts=config.contrasts, task=task),
+        epochs_tmin=_get_task_float(config.epochs_tmin, task=task),
+        epochs_tmax=_get_task_float(config.epochs_tmax, task=task),
         time_frequency_freq_min=config.time_frequency_freq_min,
         time_frequency_freq_max=config.time_frequency_freq_max,
         decode=config.decode,
+        decoding_time=config.decoding_time,
+        decoding_time_decim=config.decoding_time_decim,
         decoding_metric=config.decoding_metric,
         decoding_time_generalization=config.decoding_time_generalization,
         decoding_time_generalization_decim=config.decoding_time_generalization_decim,
         decoding_csp=config.decoding_csp,
         decoding_csp_freqs=config.decoding_csp_freqs,
         decoding_csp_times=config.decoding_csp_times,
-        decoding_contrasts=get_decoding_contrasts(config),
+        decoding_contrasts=_get_task_decoding_contrasts(config, task=task),
         random_state=config.random_state,
         n_boot=config.n_boot,
         cluster_forming_t_threshold=config.cluster_forming_t_threshold,
@@ -1027,12 +1144,8 @@ def get_config(
         interpolate_bads_grand_average=config.interpolate_bads_grand_average,
         ch_types=config.ch_types,
         eeg_reference=get_eeg_reference(config),
-        sessions=get_sessions(config),
-        exclude_subjects=config.exclude_subjects,
         report_evoked_n_time_points=config.report_evoked_n_time_points,
         cluster_permutation_p_threshold=config.cluster_permutation_p_threshold,
-        # TODO: needed because get_datatype gets called again...
-        data_type=config.data_type,
         **_bids_kwargs(config=config),
     )
     return cfg
@@ -1044,17 +1157,28 @@ def main(*, config: SimpleNamespace) -> None:
         msg = 'Skipping, task is "rest" …'
         logger.info(**gen_log_kwargs(message=msg, subject=subject))
         return
-    cfg = get_config(
-        config=config,
-    )
     exec_params = config.exec_params
     if hasattr(exec_params.overrides, "subjects"):
         msg = "Skipping, --subject is set …"
         logger.info(**gen_log_kwargs(message=msg, subject=subject))
         return
+
+    # In theory we could make this a tiny bit more efficient by combining the
+    # parallelization across tasks, but it's a pain given how get_config works
+    for task in config.all_tasks:
+        _run_decoding(config=config, task=task)
+
+
+def _run_decoding(*, config: SimpleNamespace, task: str | None) -> None:
+    subject = "average"
+    exec_params = config.exec_params
+    cfg = get_config(
+        config=config,
+        task=task,
+    )
     sessions = get_sessions(config=config)
     if cfg.decode or cfg.decoding_csp:
-        decoding_contrasts = get_decoding_contrasts(config=cfg)
+        decoding_contrasts = _get_task_decoding_contrasts(config=cfg, task=task)
     else:
         decoding_contrasts = []
     logs = list()
@@ -1066,6 +1190,7 @@ def main(*, config: SimpleNamespace) -> None:
                 exec_params=exec_params,
                 subject=subject,
                 session=session,
+                task=task,
             )
             for session in sessions
         ]
@@ -1079,6 +1204,7 @@ def main(*, config: SimpleNamespace) -> None:
                     cfg=cfg,
                     subject=subject,
                     session=session,
+                    task=task,
                     cond_1=contrast[0],
                     cond_2=contrast[1],
                     exec_params=exec_params,
@@ -1092,32 +1218,35 @@ def main(*, config: SimpleNamespace) -> None:
                     exec_params=exec_params,
                     subject=subject,
                     session=session,
+                    task=task,
                     decoding_contrasts=decoding_contrasts,
                 )
                 for session in sessions
             ]
             # Time-by-time
-            sc = [
-                (session, contrast)
-                for session in sessions
-                for contrast in decoding_contrasts
-            ]
-            parallel, run_func = parallel_func(
-                average_time_by_time_decoding,
-                exec_params=exec_params,
-                n_iter=len(sc),
-            )
-            logs += parallel(
-                run_func(
-                    cfg=cfg,
+            if cfg.decoding_time:
+                sc = [
+                    (session, contrast)
+                    for session in sessions
+                    for contrast in decoding_contrasts
+                ]
+                parallel, run_func = parallel_func(
+                    average_time_by_time_decoding,
                     exec_params=exec_params,
-                    subject=subject,
-                    session=session,
-                    cond_1=contrast[0],
-                    cond_2=contrast[1],
+                    n_iter=len(sc),
                 )
-                for session, contrast in sc
-            )
+                logs += parallel(
+                    run_func(
+                        cfg=cfg,
+                        exec_params=exec_params,
+                        subject=subject,
+                        session=session,
+                        task=task,
+                        cond_1=contrast[0],
+                        cond_2=contrast[1],
+                    )
+                    for session, contrast in sc
+                )
 
         # 3. CSP
         if cfg.decoding_csp and decoding_contrasts:
@@ -1130,6 +1259,7 @@ def main(*, config: SimpleNamespace) -> None:
                     exec_params=exec_params,
                     subject=subject,
                     session=session,
+                    task=task,
                     cond_1=contrast[0],
                     cond_2=contrast[1],
                 )

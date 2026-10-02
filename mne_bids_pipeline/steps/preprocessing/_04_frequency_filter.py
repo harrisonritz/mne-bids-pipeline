@@ -14,13 +14,12 @@ To save space, the raw data can be resampled.
 If config.interactive = True plots raw data and power spectral density.
 """  # noqa: E501
 
-from collections.abc import Iterable
+from collections.abc import Sequence
 from types import SimpleNamespace
 from typing import Any, Literal
 
 import mne
 import numpy as np
-from meegkit import dss
 from mne.io.pick import _picks_to_idx
 from mne.preprocessing import EOGRegression
 
@@ -64,10 +63,14 @@ def get_input_fnames_frequency_filter(
         task=task,
         kind=kind,
         mf_reference_run=cfg.mf_reference_run,
+        mf_reference_task=cfg.mf_reference_task,
+        add_bads=(kind == "orig"),
     )
 
 
 def zapline(
+    *,
+    cfg: SimpleNamespace,
     raw: mne.io.BaseRaw,
     subject: str,
     session: str | None,
@@ -79,26 +82,31 @@ def zapline(
     """Use Zapline to remove line frequencies."""
     if fline is None:
         return
+    from meegkit import dss  # nested: pulls pyriemann and pyplot, Zapline-only
 
     msg = f"Zapline filtering data at with {fline=} Hz."
     logger.info(**gen_log_kwargs(message=msg))
     sfreq = raw.info["sfreq"]
     picks = mne.pick_types(raw.info, meg=True, eeg=True)
-    data = raw.get_data(picks).T  # transpose to (n_samples, n_channels)
+    data = raw.get_data(picks)
+    assert isinstance(data, np.ndarray)
+    data = data.T  # transpose to (n_samples, n_channels)
     func = dss.dss_line_iter if iter_ else dss.dss_line
     out, _ = func(data, fline, sfreq)
-    raw._data[picks] = out.T  # type: ignore[invalid-assignment]
+    raw._data[picks] = out.T  # type: ignore
 
 
 def notch_filter(
+    *,
+    cfg: SimpleNamespace,
     raw: mne.io.BaseRaw,
     subject: str,
     session: str | None,
     run: str,
     task: str | None,
-    freqs: float | Iterable[float] | None,
-    trans_bandwidth: float | Literal["auto"],
-    notch_widths: float | Iterable[float] | None,
+    freqs: float | Sequence[float] | None,
+    trans_bandwidth: float,
+    notch_widths: float | Sequence[float] | None,
     run_type: RunTypeT,
     picks: IntArrayT | None,
     notch_extra_kws: dict[str, Any],
@@ -117,9 +125,9 @@ def notch_filter(
         return
 
     raw.notch_filter(
-        freqs=freqs,
+        freqs=None if freqs is None else np.atleast_1d(freqs),
         trans_bandwidth=trans_bandwidth,
-        notch_widths=notch_widths,
+        notch_widths=None if notch_widths is None else np.atleast_1d(notch_widths),
         n_jobs=N_JOBS,
         picks=picks,
         **notch_extra_kws,
@@ -127,6 +135,8 @@ def notch_filter(
 
 
 def bandpass_filter(
+    *,
+    cfg: SimpleNamespace,
     raw: mne.io.BaseRaw,
     subject: str,
     session: str | None,
@@ -167,6 +177,8 @@ def bandpass_filter(
 
 
 def resample(
+    *,
+    cfg: SimpleNamespace,
     raw: mne.io.BaseRaw,
     subject: str,
     session: str | None,
@@ -185,6 +197,7 @@ def resample(
 
 @failsafe_run(
     get_input_fnames=get_input_fnames_frequency_filter,
+    sidecars=True,
 )
 def filter_data(
     *,
@@ -200,25 +213,35 @@ def filter_data(
     out_files = dict()
     in_key = f"raw_task-{task}_run-{run}"
     bids_path_in = in_files.pop(in_key)
-    bids_path_bads_in = in_files.pop(f"{in_key}-bads", None)
+    if bids_path_in.processing == "sss":
+        bids_path_bads_in = None
+    else:
+        bids_path_bads_in = in_files.pop(f"{in_key}-bads")
     msg, run_type = _read_raw_msg(bids_path_in=bids_path_in, run=run, task=task)
     logger.info(**gen_log_kwargs(message=msg))
     if cfg.use_maxwell_filter:
         raw = mne.io.read_raw_fif(bids_path_in)
     elif run is None and task == "noise":
+        bids_path_ref_in = in_files.pop("raw_ref_run", None)
+        if bids_path_ref_in is not None and bids_path_in.processing != "sss":
+            bids_path_ref_bads_in = in_files.pop("raw_ref_run-bads")
+        else:
+            bids_path_ref_bads_in = None
         raw = import_er_data(
             cfg=cfg,
+            exec_params=exec_params,
             bids_path_er_in=bids_path_in,
-            bids_path_ref_in=in_files.pop("raw_ref_run", None),
+            bids_path_ref_in=bids_path_ref_in,
             bids_path_er_bads_in=bids_path_bads_in,
-            # take bads from this run (0)
-            bids_path_ref_bads_in=in_files.pop("raw_ref_run-bads", None),
+            # take bads from the reference run
+            bids_path_ref_bads_in=bids_path_ref_bads_in,
             prepare_maxwell_filter=False,
         )
     else:
         data_is_rest = run is None and task == "rest"
         raw = import_experimental_data(
             cfg=cfg,
+            exec_params=exec_params,
             bids_path_in=bids_path_in,
             bids_path_bads_in=bids_path_bads_in,
             data_is_rest=data_is_rest,
@@ -251,6 +274,7 @@ def filter_data(
 
     raw.load_data()
     zapline(
+        cfg=cfg,
         raw=raw,
         subject=subject,
         session=session,
@@ -260,6 +284,7 @@ def filter_data(
         iter_=cfg.zapline_iter,
     )
     notch_filter(
+        cfg=cfg,
         raw=raw,
         subject=subject,
         session=session,
@@ -273,6 +298,7 @@ def filter_data(
         notch_extra_kws=cfg.notch_extra_kws,
     )
     bandpass_filter(
+        cfg=cfg,
         raw=raw,
         subject=subject,
         session=session,
@@ -287,6 +313,7 @@ def filter_data(
         bandpass_extra_kws=cfg.bandpass_extra_kws,
     )
     resample(
+        cfg=cfg,
         raw=raw,
         subject=subject,
         session=session,
@@ -300,7 +327,7 @@ def filter_data(
     # derivatives/mne-bids-pipeline/sub-emptyroom/ses-20230412/meg
     out_files[in_key].fpath.parent.mkdir(exist_ok=True, parents=True)
     raw.save(
-        out_files[in_key],
+        out_files[in_key].fpath,
         overwrite=True,
         split_naming="bids",
         split_size=cfg._raw_split_size,
@@ -327,7 +354,7 @@ def filter_data(
                 cfg=cfg,
                 report=report,
                 bids_path_in=out_files[in_key],
-                title="Raw (filtered)",
+                title_prefix="Raw (filtered)",
                 tags=("filtered",),
                 raw=raw,
             )
@@ -343,6 +370,7 @@ def get_config(
     *,
     config: SimpleNamespace,
     subject: str,
+    session: str | None,
 ) -> SimpleNamespace:
     cfg = SimpleNamespace(
         l_freq=config.l_freq,
@@ -358,8 +386,10 @@ def get_config(
         regress_artifact=config.regress_artifact,
         notch_extra_kws=config.notch_extra_kws,
         bandpass_extra_kws=config.bandpass_extra_kws,
-        generate_reports=getattr(config, "generate_reports", True),
-        **_import_data_kwargs(config=config, subject=subject),
+        plot_psd_for_runs=config.plot_psd_for_runs,
+        generate_reports=config.generate_reports,
+        _raw_split_size=config._raw_split_size,
+        **_import_data_kwargs(config=config, subject=subject, session=session),
     )
     return cfg
 
@@ -376,6 +406,7 @@ def main(*, config: SimpleNamespace) -> None:
                 cfg=get_config(
                     config=config,
                     subject=subject,
+                    session=session,
                 ),
                 exec_params=config.exec_params,
                 subject=subject,

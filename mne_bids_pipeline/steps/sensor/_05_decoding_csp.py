@@ -15,9 +15,10 @@ from sklearn.pipeline import make_pipeline
 from mne_bids_pipeline._config_utils import (
     _bids_kwargs,
     _get_decoding_proc,
-    _get_ss,
+    _get_sst,
+    _get_task_decoding_contrasts,
+    _get_task_float,
     _restrict_analyze_channels,
-    get_decoding_contrasts,
     get_eeg_reference,
 )
 from mne_bids_pipeline._decoding import (
@@ -28,6 +29,7 @@ from mne_bids_pipeline._decoding import (
 from mne_bids_pipeline._logging import gen_log_kwargs, logger
 from mne_bids_pipeline._parallel import get_parallel_backend, parallel_func
 from mne_bids_pipeline._report import (
+    _get_prefix_tags,
     _imshow_tf,
     _open_report,
     _plot_full_epochs_decoding_scores,
@@ -90,8 +92,15 @@ def prepare_epochs_and_y(
     cfg: SimpleNamespace,
     fmin: float,
     fmax: float,
+    cache: dict[tuple[float, float], tuple[mne.BaseEpochs, IntArrayT]],
 ) -> tuple[mne.BaseEpochs, IntArrayT]:
-    """Band-pass between, sub-select the desired epochs, and prepare y."""
+    """Band-pass between, sub-select the desired epochs, and prepare y.
+
+    Results are cached per passband, so callers must not modify what they get back.
+    """
+    if (fmin, fmax) in cache:
+        return cache[(fmin, fmax)]
+
     # filtering out the conditions we are not interested in, to ensure here we
     # have a valid partition between the condition of the contrast.
 
@@ -108,6 +117,7 @@ def prepare_epochs_and_y(
     epochs_filt = epochs_filt.filter(fmin, fmax, n_jobs=1, verbose="error")
     y = _prepare_labels(epochs=epochs_filt, contrast=contrast)
 
+    cache[(fmin, fmax)] = (epochs_filt, y)
     return epochs_filt, y
 
 
@@ -116,13 +126,14 @@ def get_input_fnames_csp(
     cfg: SimpleNamespace,
     subject: str,
     session: str | None,
+    task: str | None,
     contrast: tuple[str],
 ) -> InFilesT:
     proc = _get_decoding_proc(config=cfg)
     fname_epochs = BIDSPath(
         subject=subject,
         session=session,
-        task=cfg.task,
+        task=task,
         acquisition=cfg.acq,
         run=None,
         recording=cfg.rec,
@@ -147,6 +158,7 @@ def one_subject_decoding(
     exec_params: SimpleNamespace,
     subject: str,
     session: str,
+    task: str | None,
     contrast: tuple[str, str],
     in_files: InFilesT,
 ) -> OutFilesT:
@@ -163,7 +175,7 @@ def one_subject_decoding(
     logger.info(**gen_log_kwargs(msg))
 
     bids_path = in_files["epochs"].copy().update(processing=None, split=None)
-    epochs = mne.read_epochs(in_files.pop("epochs"))
+    epochs = mne.read_epochs(in_files.pop("epochs").fpath)
     _restrict_analyze_channels(epochs, cfg)
     pick_idx = mne.pick_types(
         epochs.info, meg=True, eeg=True, ref_meg=False, exclude="bads"
@@ -177,6 +189,7 @@ def one_subject_decoding(
         cfg=cfg,
         subject=subject,
         session=session,
+        task=task,
         epochs=epochs,
     )
 
@@ -237,6 +250,8 @@ def one_subject_decoding(
         freq_range_name: str,
         tmin: float | None = None,
         tmax: float | None = None,
+        *,
+        score: float,
     ) -> str:
         msg = (
             f"Contrast: {cond1} – {cond2}, "
@@ -244,7 +259,12 @@ def one_subject_decoding(
         )
         if tmin is not None:
             msg += f" {tmin:+5.3f}–{tmax:+5.3f} sec"
+        msg += f": {cfg.decoding_metric}={score:0.3f}"
         return msg
+
+    # Only a handful of distinct passbands are used by the two tables below, and
+    # filtering dominates the runtime, so filter each one once (cropping comes after)
+    filt_cache: dict[tuple[float, float], tuple[mne.BaseEpochs, IntArrayT]] = dict()
 
     for idx, row in freq_decoding_table.iterrows():
         assert isinstance(row, pd.Series)
@@ -254,13 +274,13 @@ def one_subject_decoding(
         cond2 = row["cond_2"]
         freq_range_name = row["freq_range_name"]
 
-        msg = _fmt_contrast(cond1, cond2, fmin, fmax, freq_range_name)
-        logger.info(**gen_log_kwargs(msg))
-
-        # XXX We're filtering here again in each iteration. This should be
-        # XXX optimized.
         epochs_filt, y = prepare_epochs_and_y(
-            epochs=epochs, contrast=contrast, fmin=fmin, fmax=fmax, cfg=cfg
+            epochs=epochs,
+            contrast=contrast,
+            fmin=fmin,
+            fmax=fmax,
+            cfg=cfg,
+            cache=filt_cache,
         )
         # Get the data for all time points
         X = epochs_filt.get_data()
@@ -274,8 +294,11 @@ def one_subject_decoding(
             n_jobs=1,
             error_score="raise",
         )
-        freq_decoding_table.loc[idx, "mean_crossval_score"] = cv_scores.mean()
+        score = cv_scores.mean()
+        freq_decoding_table.loc[idx, "mean_crossval_score"] = score
         freq_decoding_table.at[idx, "scores"] = cv_scores
+        msg = _fmt_contrast(cond1, cond2, fmin, fmax, freq_range_name, score=score)
+        logger.info(**gen_log_kwargs(msg))
         del fmin, fmax, cond1, cond2, freq_range_name
 
     # Loop over times x frequencies
@@ -327,12 +350,17 @@ def one_subject_decoding(
         freq_range_name = row["freq_range_name"]
 
         epochs_filt, y = prepare_epochs_and_y(
-            epochs=epochs, contrast=contrast, fmin=fmin, fmax=fmax, cfg=cfg
+            epochs=epochs,
+            contrast=contrast,
+            fmin=fmin,
+            fmax=fmax,
+            cfg=cfg,
+            cache=filt_cache,
         )
         # Crop data to the time window of interest
         if tmax is not None:  # avoid warnings about outside the interval
             tmax = min(tmax, epochs_filt.times[-1])
-        X = epochs_filt.crop(tmin, tmax).get_data()
+        X = epochs_filt.copy().crop(tmin, tmax).get_data()  # cached, so don't crop it
         del epochs_filt
         cv_scores = cross_val_score(
             estimator=clf,
@@ -346,10 +374,20 @@ def one_subject_decoding(
         score = cv_scores.mean()
         tf_decoding_table.loc[idx, "mean_crossval_score"] = score
         tf_decoding_table.at[idx, "scores"] = cv_scores
-        msg = _fmt_contrast(cond1, cond2, fmin, fmax, freq_range_name, tmin, tmax)
-        msg += f": {cfg.decoding_metric}={score:0.3f}"
+        msg = _fmt_contrast(
+            cond1,
+            cond2,
+            fmin,
+            fmax,
+            freq_range_name,
+            tmin,
+            tmax,
+            score=score,
+        )
         logger.info(**gen_log_kwargs(msg))
         del tmin, tmax, fmin, fmax, cond1, cond2, freq_range_name
+
+    del filt_cache  # free the filtered copies before building the report
 
     # Write each DataFrame to a different Excel worksheet.
     a_vs_b = f"{condition1}+{condition2}".replace(op.sep, "")
@@ -368,22 +406,17 @@ def one_subject_decoding(
 
     # Report
     with _open_report(
-        cfg=cfg, exec_params=exec_params, subject=subject, session=session
+        cfg=cfg, exec_params=exec_params, subject=subject, session=session, task=task
     ) as report:
         msg = "Adding CSP decoding results to the report."
         logger.info(**gen_log_kwargs(message=msg))
         section = "Decoding: CSP"
         all_csp_tf_results = dict()
         for contrast in cfg.decoding_contrasts:
+            prefix, extra_tags = _get_prefix_tags(cfg=cfg, task=task, contrast=contrast)
             cond_1, cond_2 = contrast
             a_vs_b = f"{cond_1}+{cond_2}".replace(op.sep, "")
-            tags = (
-                "epochs",
-                "contrast",
-                "decoding",
-                "csp",
-                f"{_sanitize_cond_tag(cond_1)}–{_sanitize_cond_tag(cond_2)}",
-            )
+            tags = ("epochs", "contrast", "decoding", "csp") + extra_tags
             processing = f"{a_vs_b}+CSP+{cfg.decoding_metric}"
             processing = processing.replace("_", "-").replace("-", "")
             fname_decoding = bids_path.copy().update(
@@ -425,7 +458,7 @@ def one_subject_decoding(
                 scores=all_decoding_scores,
                 metric=cfg.decoding_metric,
             )
-            title = f"CSP decoding: {cond_1} vs. {cond_2}"
+            title = f"CSP decoding: {prefix}"
             report.add_figure(
                 fig=fig,
                 title=title,
@@ -524,7 +557,11 @@ def one_subject_decoding(
 
 
 def get_config(
-    *, config: SimpleNamespace, subject: str, session: str | None
+    *,
+    config: SimpleNamespace,
+    subject: str,
+    session: str | None,
+    task: str | None,
 ) -> SimpleNamespace:
     cfg = SimpleNamespace(
         # Data parameters
@@ -532,8 +569,8 @@ def get_config(
         ch_types=config.ch_types,
         eeg_reference=get_eeg_reference(config),
         # Processing parameters
-        epochs_tmin=config.epochs_tmin,
-        epochs_tmax=config.epochs_tmax,
+        epochs_tmin=_get_task_float(config.epochs_tmin, task=task),
+        epochs_tmax=_get_task_float(config.epochs_tmax, task=task),
         time_frequency_freq_min=config.time_frequency_freq_min,
         time_frequency_freq_max=config.time_frequency_freq_max,
         time_frequency_subtract_evoked=config.time_frequency_subtract_evoked,
@@ -542,7 +579,7 @@ def get_config(
         decoding_csp_freqs=config.decoding_csp_freqs,
         decoding_csp_times=config.decoding_csp_times,
         decoding_n_splits=config.decoding_n_splits,
-        decoding_contrasts=get_decoding_contrasts(config),
+        decoding_contrasts=_get_task_decoding_contrasts(config, task=task),
         cov_rank=config.cov_rank,
         random_state=config.random_state,
         **_bids_kwargs(config=config),
@@ -561,24 +598,27 @@ def main(*, config: SimpleNamespace) -> None:
         logger.info(**gen_log_kwargs(message="SKIP"))
         return
 
-    ss = _get_ss(config=config)
-    ssc = [
-        (subject, session, contrast)
-        for subject, session in ss
-        for contrast in get_decoding_contrasts(config)
+    sst = _get_sst(config=config)
+    sstc = [
+        (subject, session, task, contrast)
+        for subject, session, task in sst
+        for contrast in _get_task_decoding_contrasts(config, task=task)
     ]
     with get_parallel_backend(config.exec_params):
         parallel, run_func = parallel_func(
-            one_subject_decoding, exec_params=config.exec_params, n_iter=len(ssc)
+            one_subject_decoding, exec_params=config.exec_params, n_iter=len(sstc)
         )
         logs = parallel(
             run_func(
-                cfg=get_config(config=config, subject=subject, session=session),
+                cfg=get_config(
+                    config=config, subject=subject, session=session, task=task
+                ),
                 exec_params=config.exec_params,
                 subject=subject,
                 session=session,
+                task=task,
                 contrast=contrast,
             )
-            for subject, session, contrast in ssc
+            for subject, session, task, contrast in sstc
         )
         save_logs(logs=logs, config=config)
