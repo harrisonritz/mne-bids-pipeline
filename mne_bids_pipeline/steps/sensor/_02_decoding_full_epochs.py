@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import mne
 import numpy as np
 import pandas as pd
-from mne.decoding import LinearModel, get_coef
+from mne.decoding import LinearModel, Vectorizer, get_coef
 from mne_bids import BIDSPath
 from scipy.io import loadmat, savemat
 from sklearn.linear_model import LogisticRegression
@@ -177,6 +177,7 @@ def run_epochs_decoding(
         #     LogReg(random_state=cfg.random_state),
         # )
         clf = make_pipeline(
+            Vectorizer(),
             StandardScaler(),
             LogisticRegression(solver="liblinear"),
         )
@@ -222,12 +223,15 @@ def run_epochs_decoding(
         #     Vectorizer(),
         #     LinearModel(LogReg(random_state=cfg.random_state)),
         # )
+        # The epochs are flattened here rather than with a Vectorizer step: with one,
+        # get_coef(..., inverse_transform=True) returns (n_times, n_ch) in MNE >= 1.11
+        # but (n_ch, n_times) before, so the reshape below would be version-dependent.
         clf = make_pipeline(
             StandardScaler(),
             LinearModel(LogisticRegression(solver="liblinear")),
         )
-        clf.fit(X, y)
         n_ch, n_times = X.shape[1], X.shape[2]
+        clf.fit(X.reshape(len(X), n_ch * n_times), y)
         patterns = get_coef(clf, attr="patterns_", inverse_transform=True)
         filters = get_coef(clf, attr="filters_", inverse_transform=True)
         patterns = patterns.reshape(n_ch, n_times)
