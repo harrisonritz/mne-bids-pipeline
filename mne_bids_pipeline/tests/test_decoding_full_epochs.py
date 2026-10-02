@@ -194,8 +194,8 @@ def test_full_epochs_decoding_too_few_epochs(tmp_path: Path) -> None:
     assert not list((tmp_path / "derivatives").rglob("*weights*"))
 
 
-def test_full_epochs_patterns_in_data_units(tmp_path: Path) -> None:
-    """Patterns are mean-free covariance quantities in the units of the data."""
+def test_full_epochs_weights_in_data_units(tmp_path: Path) -> None:
+    """Patterns and filters are expressed in the units of the data."""
     ref = _load_weights(_run(tmp_path / "ref"))
     shifted = _load_weights(_run(tmp_path / "shifted", offset=5 * UNIT))
     scaled = _load_weights(_run(tmp_path / "scaled", gain=GAIN))
@@ -203,13 +203,19 @@ def test_full_epochs_patterns_in_data_units(tmp_path: Path) -> None:
     for other in (shifted, scaled):
         pd.testing.assert_frame_equal(other[index], ref[index])
 
-    def patterns(df: pd.DataFrame) -> np.ndarray:
-        return df.query("kind == 'patterns'")["value"].to_numpy()
+    def values(df: pd.DataFrame, kind: str) -> np.ndarray:
+        return df.query("kind == @kind")["value"].to_numpy()
 
-    atol = 1e-5 * np.abs(patterns(ref)).max()
-    # a constant offset of the data is not part of a pattern ...
-    np.testing.assert_allclose(patterns(shifted), patterns(ref), rtol=0, atol=atol)
-    # ... and a pattern scales with the data
-    np.testing.assert_allclose(
-        patterns(scaled), GAIN * patterns(ref), rtol=0, atol=GAIN * atol
-    )
+    for kind, power in ("patterns", 1), ("filters", -1):
+        atol = 1e-5 * np.abs(values(ref, kind)).max()
+        # a constant offset of the data is not part of a pattern or filter ...
+        np.testing.assert_allclose(
+            values(shifted, kind), values(ref, kind), rtol=0, atol=atol
+        )
+        # ... patterns scale with the data, filters (which act on it) inversely
+        np.testing.assert_allclose(
+            values(scaled, kind),
+            GAIN**power * values(ref, kind),
+            rtol=0,
+            atol=GAIN**power * atol,
+        )
