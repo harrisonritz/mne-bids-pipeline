@@ -232,7 +232,13 @@ def run_epochs_decoding(
         )
         n_ch, n_times = X.shape[1], X.shape[2]
         clf.fit(X.reshape(len(X), n_ch * n_times), y)
-        patterns = get_coef(clf, attr="patterns_", inverse_transform=True)
+        # LinearModel computes the patterns from mean-centered, standardized features.
+        # get_coef(..., inverse_transform=True) would map them back through
+        # StandardScaler.inverse_transform (coef * scale + mean), which adds the feature
+        # means to a covariance quantity. In data units a pattern only needs the scale:
+        # Cov(X) @ w_data == scale * pattern_standardized.
+        patterns = get_coef(clf, attr="patterns_", inverse_transform=False)
+        patterns = patterns * clf[0].scale_
         filters = get_coef(clf, attr="filters_", inverse_transform=True)
         patterns = patterns.reshape(n_ch, n_times)
         filters = filters.reshape(n_ch, n_times)

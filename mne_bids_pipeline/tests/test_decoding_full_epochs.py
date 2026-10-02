@@ -22,10 +22,14 @@ TMIN, TMAX = -0.1, 0.5  # -> 61 samples
 EFFECT_TMIN = 0.3  # the planted effect is late, starting here
 EFFECT_AMP = 1.0
 UNIT = 1e-13  # magnetometer data in T, ~100 fT
+GAIN = 1e3  # a change of the data units, to check how the weights scale
 
 
-def _make_epochs() -> mne.EpochsArray:
-    """Make two-condition magnetometer epochs with a planted late effect."""
+def _make_epochs(*, gain: float = 1.0, offset: float = 0.0) -> mne.EpochsArray:
+    """Make two-condition magnetometer epochs with a planted late effect.
+
+    The data are multiplied by ``gain`` and then shifted by the constant ``offset``.
+    """
     rng = np.random.default_rng(0)
     ch_names = [f"MAG{ii:03d}" for ii in range(N_CH)]
     info = mne.create_info(ch_names, SFREQ, "mag")
@@ -49,6 +53,7 @@ def _make_epochs() -> mne.EpochsArray:
     # plant the effect in condition "b": a few channels, late in the epoch
     late = times >= EFFECT_TMIN - 1e-9
     data[N_EPOCHS_PER_COND:, :N_EFFECT_CH, late] += EFFECT_AMP * UNIT
+    data = data * gain + offset
     events = np.c_[np.arange(n_epochs) * 100, np.zeros(n_epochs, int), event_id]
     # each group holds both conditions, as LOGO scoring requires
     grp = np.tile(np.arange(N_GROUPS), n_epochs // N_GROUPS)
@@ -64,7 +69,9 @@ def _make_epochs() -> mne.EpochsArray:
     )
 
 
-def _run(tmp_path: Path, **cfg_overrides: Any) -> dict[str, Any]:
+def _run(
+    tmp_path: Path, *, gain: float = 1.0, offset: float = 0.0, **cfg_overrides: Any
+) -> dict[str, Any]:
     """Run the undecorated step function on synthetic epochs."""
     deriv_root = tmp_path / "derivatives"
     cfg = SimpleNamespace(
@@ -110,7 +117,7 @@ def _run(tmp_path: Path, **cfg_overrides: Any) -> dict[str, Any]:
         check=False,
     )
     bids_path.fpath.parent.mkdir(parents=True)
-    _make_epochs().save(bids_path.fpath, verbose="error")
+    _make_epochs(gain=gain, offset=offset).save(bids_path.fpath, verbose="error")
     kwargs: dict[str, Any] = dict(
         subject="01", session=None, task="test", condition1="a", condition2="b"
     )
@@ -185,3 +192,24 @@ def test_full_epochs_decoding_too_few_epochs(tmp_path: Path) -> None:
     assert np.isnan(scores).all()
     assert not any("weights" in key for key in out_files)
     assert not list((tmp_path / "derivatives").rglob("*weights*"))
+
+
+def test_full_epochs_patterns_in_data_units(tmp_path: Path) -> None:
+    """Patterns are mean-free covariance quantities in the units of the data."""
+    ref = _load_weights(_run(tmp_path / "ref"))
+    shifted = _load_weights(_run(tmp_path / "shifted", offset=5 * UNIT))
+    scaled = _load_weights(_run(tmp_path / "scaled", gain=GAIN))
+    index = ["kind", "ch_name", "time"]
+    for other in (shifted, scaled):
+        pd.testing.assert_frame_equal(other[index], ref[index])
+
+    def patterns(df: pd.DataFrame) -> np.ndarray:
+        return df.query("kind == 'patterns'")["value"].to_numpy()
+
+    atol = 1e-5 * np.abs(patterns(ref)).max()
+    # a constant offset of the data is not part of a pattern ...
+    np.testing.assert_allclose(patterns(shifted), patterns(ref), rtol=0, atol=atol)
+    # ... and a pattern scales with the data
+    np.testing.assert_allclose(
+        patterns(scaled), GAIN * patterns(ref), rtol=0, atol=GAIN * atol
+    )
