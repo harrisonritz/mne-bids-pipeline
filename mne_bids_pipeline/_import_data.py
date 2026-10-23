@@ -982,7 +982,7 @@ def _import_data_kwargs(
     """Get config params needed for any raw data loading.
 
     Automatic bad-channel detection params are *not* included; only
-    ``preprocessing/_01_data_quality`` does that, and it adds them itself.
+    ``preprocessing/_01a_data_quality`` does that, and it adds them itself.
     """
     return dict(
         # import_experimental_data / general

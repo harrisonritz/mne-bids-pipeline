@@ -581,7 +581,7 @@ h_freq = 40
     # Step 3: run frequency filtering. With custom_proc='init', the pipeline
     # must read from deriv_root (not bids_root). Run only the steps needed
     # to exercise the redirection: data quality + frequency filtering.
-    # _01_data_quality is the first step that reads "orig" data, and it
+    # _01a_data_quality is the first step that reads "orig" data, and it
     # also writes a bads.tsv that _04 needs.
     monkeypatch.setattr(
         sys,
@@ -589,7 +589,7 @@ h_freq = 40
         [
             "mne_bids_pipeline",
             str(config_path),
-            "--steps=preprocessing/_01_data_quality,preprocessing/_04_frequency_filter",
+            "--steps=preprocessing/_01a_data_quality,preprocessing/_04_frequency_filter",
         ],
     )
     with capsys.disabled():
