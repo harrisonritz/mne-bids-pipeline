@@ -15,6 +15,7 @@ from typing import Any
 
 import mne
 import numpy as np
+from mne.utils import check_version
 from mne_bids import get_entity_vals
 from pydantic import BaseModel, ConfigDict, ValidationError
 
@@ -580,6 +581,18 @@ def _check_config(config: SimpleNamespace, config_path: PathLike | None) -> None
             raise ValueError(
                 "config.mf_destination, if array-like, must have shape (4, 4) "
                 f"but got shape {destination.shape}"
+            )
+
+    if config.spatial_filter == "ica" and config.ica_algorithm == "jamica":
+        try:
+            mne.preprocessing.ICA(method="jamica")
+        except ValueError:
+            raise ConfigError(
+                'ica_algorithm="jamica" requires MNE-Python >= 1.13.'
+            ) from None
+        if not check_version("jamica", "0.3.0"):
+            raise ConfigError(
+                'ica_algorithm="jamica" requires the jamica package (>= 0.3.0).'
             )
 
     # MNE-ICALabel

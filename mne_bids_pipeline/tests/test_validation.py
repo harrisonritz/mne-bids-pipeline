@@ -1,5 +1,6 @@
 """Test the pipeline configuration import validator."""
 
+import sys
 from pathlib import Path
 from shutil import rmtree
 
@@ -23,7 +24,11 @@ def test_rest_epochs_duration_validation(tmp_path: Path) -> None:
     _import_config(config_path=config_path)
 
 
-def test_validation(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_validation(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Test that misspellings are caught by our config import validator."""
     config_path = tmp_path / "config.py"
     bad_text = ""
@@ -93,6 +98,15 @@ def test_validation(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
             working_text + f"zapline_extra_kws = {{{key!r}: {value!r}}}\n"
         )
         with pytest.raises(ConfigError, match=key):
+            _import_config(config_path=config_path)
+
+    # AMICA needs the optional jamica package
+    config_path.write_text(
+        working_text + "spatial_filter = 'ica'\nica_algorithm = 'jamica'\n"
+    )
+    with monkeypatch.context() as m:
+        m.setitem(sys.modules, "jamica", None)  # makes `import jamica` fail
+        with pytest.raises(ConfigError, match='ica_algorithm="jamica" requires'):
             _import_config(config_path=config_path)
 
     # ecg_channel_dict key validation (all subjects have channels specified)
