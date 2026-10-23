@@ -54,7 +54,8 @@ def get_input_fnames_frequency_filter(
     task: str | None,
 ) -> InFilesT:
     """Get paths of files required by filter_data function."""
-    kind: RunKindT = "sss" if cfg.use_maxwell_filter else "orig"
+    otp_used = "otp" if cfg.otp else "orig"
+    kind: RunKindT = "sss" if cfg.use_maxwell_filter else otp_used
     return _get_run_rest_noise_path(
         cfg=cfg,
         subject=subject,
@@ -77,23 +78,32 @@ def zapline(
     run: str,
     task: str | None,
     fline: float | None,
-    iter_: bool,
+    zapline_extra_kws: dict[str, Any],
 ) -> None:
-    """Use Zapline to remove line frequencies."""
+    """Use ZapLine to remove line frequencies."""
     if fline is None:
         return
-    from meegkit import dss  # nested: pulls pyriemann and pyplot, Zapline-only
 
-    msg = f"Zapline filtering data at with {fline=} Hz."
+    from mne_denoise.zapline import ZapLine
+
+    msg = f"ZapLine filtering data at {fline} Hz."
     logger.info(**gen_log_kwargs(message=msg))
-    sfreq = raw.info["sfreq"]
+
+    zapline_kws: dict[str, Any] = dict(n_select=1, adaptive=False)
+    zapline_kws.update(zapline_extra_kws)
+    model = ZapLine(
+        sfreq=raw.info["sfreq"],
+        line_freq=fline,
+        **zapline_kws,
+    )
+
     picks = mne.pick_types(raw.info, meg=True, eeg=True)
-    data = raw.get_data(picks)
-    assert isinstance(data, np.ndarray)
-    data = data.T  # transpose to (n_samples, n_channels)
-    func = dss.dss_line_iter if iter_ else dss.dss_line
-    out, _ = func(data, fline, sfreq)
-    raw._data[picks] = out.T  # type: ignore
+    # ZapLine is multichannel, so process all selected MEG/EEG channels together.
+    raw.apply_function(
+        model.fit_transform,
+        picks=picks,
+        channel_wise=False,
+    )
 
 
 def notch_filter(
@@ -213,14 +223,14 @@ def filter_data(
     out_files = dict()
     in_key = f"raw_task-{task}_run-{run}"
     bids_path_in = in_files.pop(in_key)
-    if bids_path_in.processing == "sss":
+    if bids_path_in.processing in ("sss", "otp"):
         bids_path_bads_in = None
     else:
         bids_path_bads_in = in_files.pop(f"{in_key}-bads")
     msg, run_type = _read_raw_msg(bids_path_in=bids_path_in, run=run, task=task)
     logger.info(**gen_log_kwargs(message=msg))
-    if cfg.use_maxwell_filter:
-        raw = mne.io.read_raw_fif(bids_path_in)
+    if cfg.use_maxwell_filter or cfg.otp:
+        raw = mne.io.read_raw_fif(bids_path_in, allow_maxshield=cfg.otp)
     elif run is None and task == "noise":
         bids_path_ref_in = in_files.pop("raw_ref_run", None)
         if bids_path_ref_in is not None and bids_path_in.processing != "sss":
@@ -281,7 +291,7 @@ def filter_data(
         run=run,
         task=task,
         fline=cfg.zapline_fline,
-        iter_=cfg.zapline_iter,
+        zapline_extra_kws=cfg.zapline_extra_kws,
     )
     notch_filter(
         cfg=cfg,
@@ -377,7 +387,7 @@ def get_config(
         h_freq=config.h_freq,
         notch_freq=config.notch_freq,
         zapline_fline=config.zapline_fline,
-        zapline_iter=config.zapline_iter,
+        zapline_extra_kws=config.zapline_extra_kws,
         l_trans_bandwidth=config.l_trans_bandwidth,
         h_trans_bandwidth=config.h_trans_bandwidth,
         notch_trans_bandwidth=config.notch_trans_bandwidth,
@@ -389,6 +399,7 @@ def get_config(
         plot_psd_for_runs=config.plot_psd_for_runs,
         generate_reports=config.generate_reports,
         _raw_split_size=config._raw_split_size,
+        otp=config.use_otp_denoising,
         **_import_data_kwargs(config=config, subject=subject, session=session),
     )
     return cfg

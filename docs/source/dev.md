@@ -7,6 +7,7 @@
 - Added [`ignore_warnings`][mne_bids_pipeline._config.ignore_warnings] config option to allow users to specify warnings to ignore when calling `read_raw_bids` (#1224 by @larsoner)
 - Added tracking of the current step in the terminal title (#1266 by @larsoner)
 - Added a "Pipeline flow" section to the reports with an auto-generated diagram of the steps that ran for a subject and the files they passed to one another (#1291 by @larsoner)
+- Added a new denoising technique, oversampled temporal projection, to the preprocessing steps (#1297 by @nordme and @sylvchev)
 - Added [`report_image_format`][mne_bids_pipeline._config.report_image_format] config option to control the encoding of images embedded in reports, e.g. `dict(raster="png")` to trade larger reports for faster processing (#1300 by @larsoner)
 - Report HDF5 and HTML files are no longer rewritten when a step did not modify the report (requires MNE-Python ≥ 1.13; older versions keep the previous always-save behavior) (#1300 by @larsoner)
 - [`report_image_format`][mne_bids_pipeline._config.report_image_format] now accepts `dict(raster="webp-lossy")`, which encodes about as fast as PNG while producing reports roughly 3× smaller (requires MNE-Python ≥ 1.13) (#1304 by @larsoner)
@@ -15,6 +16,7 @@
 ### :warning: Behavior changes
 
 - The default for [`mne_log_level`][mne_bids_pipeline._config.mne_log_level] has been changed from `'error'` to `'warning'` to make possible dataset and processing errors more visible (#1224 by @larsoner)
+- ZapLine line-noise removal now uses `mne-denoise` instead of `meegkit`. [`zapline_fline`][mne_bids_pipeline._config.zapline_fline] continues to control the line frequency and whether ZapLine is enabled; `zapline_iter` has been removed with no direct replacement, and advanced behavior can be configured with [`zapline_extra_kws`][mne_bids_pipeline._config.zapline_extra_kws]. ZapLine and notch filtering cannot be enabled together (#1313 by @BabaSanfour).
 
 ### :package: Requirements
 
@@ -43,3 +45,4 @@
 - The CSP decoding step now band-pass filters the epochs once per passband instead of once per table row, cutting its runtime roughly in half with identical results (#1304 by @larsoner)
 - The pipeline flow recordings are now read and written with the standard-library `json` module rather than `json_tricks` (about 8× faster for their plain-JSON schema) and memoized per process, so a step no longer re-parses the whole recording on each of its calls (#1305 by @larsoner)
 - Moved from `lefthook` to `prek` for pre-commit hooks, matching MNE-Python, and removed the no-longer-needed bot workflow that pushed commits to trigger CircleCI on Dependabot PRs (#1310 by @larsoner)
+- Added `AGENTS.md` (and a `CLAUDE.md` pointing to it) with guidance for AI coding agents, deferring to MNE-Python's policy on AI assistance (#1317 by @larsoner)
