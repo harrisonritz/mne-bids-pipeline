@@ -241,7 +241,12 @@ def drop_ptp(
                 replace=True,
                 **_add_epochs_image_kwargs(cfg=cfg),
             )
-    return _prep_out_files(exec_params=exec_params, out_files=out_files)
+    # External steps (e.g. mne-opm's bad_epochs) may edit the cleaned epochs, so
+    # only require that they exist; otherwise re-running would undo those edits
+    exist_only = tuple(key for key in out_files if key.startswith("epochs"))
+    return _prep_out_files(
+        exec_params=exec_params, out_files=out_files, exist_only=exist_only
+    )
 
 
 def get_config(

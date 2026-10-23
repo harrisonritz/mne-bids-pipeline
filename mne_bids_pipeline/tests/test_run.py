@@ -613,6 +613,20 @@ h_freq = 40
     assert raw_filt.info["sfreq"] == sfreq
     assert raw_filt.n_times == n_samples
 
+    # Step 4: external steps (e.g. mne-opm's bad_epochs) may edit the cleaned
+    # epochs; re-running ptp_reject must not overwrite those edits.
+    steps = "--steps=preprocessing/_07_make_epochs,preprocessing/_09_ptp_reject"
+    monkeypatch.setattr(sys, "argv", ["mne_bids_pipeline", str(config_path), steps])
+    with capsys.disabled():
+        main()
+    clean_path = filt_path.parent / "sub-01_task-foo_proc-clean_epo.fif"
+    epochs = mne.read_epochs(clean_path)
+    assert len(epochs) == 2
+    epochs.drop([0]).save(clean_path, overwrite=True)
+    with capsys.disabled():
+        main()
+    assert len(mne.read_epochs(clean_path)) == 1
+
 
 @pytest.mark.dataset_test
 def test_session_specific_mri(
